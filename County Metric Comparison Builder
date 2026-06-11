@@ -1,0 +1,521 @@
+"""
+Q1_2 County Metric Comparison Builder — CORRECTED VERSION
+==========================================================
+Fixes applied relative to the original script:
+
+  FIX 1: Outage events are grouped by (event_id, county_fips), not event_id
+         alone. If the same event_id ever spans multiple counties, each
+         county now gets its own event row instead of being collapsed
+         into one county with summed AUC.
+
+  FIX 2: County event counts use .size() on the event table instead of
+         event_id.nunique(). Each row of the event table is already one
+         unique (event_id, county, year) event, so .size() is correct
+         even when event IDs restart every year (nunique would have
+         undercounted in the 2015-2025 aggregate).
+
+  NEW:   16-class (4x4 quartile) exposure-burden classification added
+         alongside the original 4-class scheme, plus a
+         `total_customers_served` column matching the paper spec.
+
+Outputs (in {OUT_DIR}):
+  - outage_event_table_2015_2025.csv
+  - county_year_customer_denominator_2015_2025.csv
+  - county_level_storm_records_2015_2025.csv
+  - storm_linked_outage_events_2015_2025.csv
+  - county_metric_comparison_2015_2025.csv          (11-yr aggregate)
+  - county_metric_comparison_yearly_2015_2025.csv   (long format)
+  - yearly/county_metric_comparison_{year}.csv
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# Paths
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+
+OUTAGE_DIR = f"{BASE}/Power_Outage_ZeroFill/Norm_Event_Max"
+STORM_DIR  = f"{BASE}/Storms"
+
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+YEARLY_OUT_DIR = f"{OUT_DIR}/yearly"
+os.makedirs(YEARLY_OUT_DIR, exist_ok=True)
+
+YEARS = list(range(2015, 2026))
+
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def read_csv_safe(path):
+    try:
+        return pd.read_csv(path, encoding="utf-8", low_memory=False)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="latin-1", low_memory=False)
+
+
+def clean_fips(x):
+    if pd.isna(x):
+        return np.nan
+    x = str(x).strip()
+    if x.endswith(".0"):
+        x = x[:-2]
+    try:
+        if "." in x:
+            x = str(int(float(x)))
+    except Exception:
+        pass
+    return x.zfill(5)
+
+
+def build_storm_fips(state_fips, county_fips):
+    if pd.isna(state_fips) or pd.isna(county_fips):
+        return np.nan
+    try:
+        sf = str(int(float(state_fips))).zfill(2)
+        cf = str(int(float(county_fips))).zfill(3)
+        return sf + cf
+    except Exception:
+        return np.nan
+
+
+def is_conus_fips(fips):
+    if pd.isna(fips):
+        return False
+    fips = str(fips).zfill(5)
+    return fips[:2] not in NON_CONUS_PREFIXES
+
+
+def percentile_0_100(series):
+    return series.rank(pct=True, method="average") * 100
+
+
+def classify_exposure_impact_4(row):
+    """Original 2x2 (4-class) scheme based on fixed 50th percentile."""
+    high_exposure = row["exposure_percentile"] >= 50
+    high_burden = row["burden_percentile"] >= 50
+    if high_exposure and high_burden:
+        return "High Exposure - High Burden"
+    elif high_exposure and not high_burden:
+        return "High Exposure - Low Burden"
+    elif not high_exposure and high_burden:
+        return "Low Exposure - High Burden"
+    else:
+        return "Low Exposure - Low Burden"
+
+
+def quartile_label(pct):
+    """Map a 0-100 percentile to Q1..Q4 (Q4 = highest)."""
+    if pd.isna(pct):
+        return np.nan
+    if pct <= 25:
+        return "Q1"
+    elif pct <= 50:
+        return "Q2"
+    elif pct <= 75:
+        return "Q3"
+    else:
+        return "Q4"
+
+
+# ============================================================
+# 1. Build event-level outage table from raw 15-min snapshots
+#    FIX 1: group by (event_id, county_fips)
+# ============================================================
+
+event_parts = []
+served_year_parts = []
+
+for year in YEARS:
+    outage_path = f"{OUTAGE_DIR}/norm_event_max_{year}.csv"
+
+    if not os.path.exists(outage_path):
+        print(f"WARNING: missing outage file for {year}: {outage_path}")
+        continue
+
+    print(f"Reading outage file: {outage_path}")
+
+    odf = read_csv_safe(outage_path)
+    odf.columns = [c.strip() for c in odf.columns]
+
+    required_cols = [
+        "fips_code", "county", "state", "snapshot_time",
+        "customers_out", "county_year_max", "event_id"
+    ]
+    missing = [c for c in required_cols if c not in odf.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {outage_path}: {missing}")
+
+    odf["county_fips"] = odf["fips_code"].apply(clean_fips)
+    odf = odf[odf["county_fips"].apply(is_conus_fips)].copy()
+
+    odf["snapshot_time"] = pd.to_datetime(odf["snapshot_time"], errors="coerce")
+    odf["customers_out"] = pd.to_numeric(odf["customers_out"], errors="coerce")
+    odf["county_year_max"] = pd.to_numeric(odf["county_year_max"], errors="coerce")
+
+    odf = odf.dropna(subset=["county_fips", "snapshot_time", "event_id"])
+
+    # --------------------------------------------------------
+    # County-year denominator (max customers served by county-year)
+    # --------------------------------------------------------
+    served_y = (
+        odf.groupby("county_fips", as_index=False)
+        .agg(
+            county_name=("county", "first"),
+            state=("state", "first"),
+            max_customers_served_by_year=("county_year_max", "max")
+        )
+    )
+    served_y["year"] = year
+    served_year_parts.append(served_y)
+
+    # --------------------------------------------------------
+    # Event-level outage metrics — one row per (event_id, county)
+    # Vectorized (much faster than .apply) and FIX 1 compliant.
+    # --------------------------------------------------------
+    gb = odf.groupby(["event_id", "county_fips"])
+
+    eyear = gb.agg(
+        county_name=("county", "first"),
+        state=("state", "first"),
+        event_start=("snapshot_time", "min"),
+        event_end=("snapshot_time", "max"),
+        peak_customers_out=("customers_out", "max"),
+        auc=("customers_out", lambda x: x.sum() * 0.25),
+        max_customers_served_by_year=("county_year_max", "max"),
+    ).reset_index()
+
+    # peak time per (event_id, county_fips) -> recovery_hr
+    idx_peak = gb["customers_out"].idxmax()
+    peak_times = odf.loc[idx_peak, ["event_id", "county_fips", "snapshot_time"]].rename(
+        columns={"snapshot_time": "peak_time"}
+    )
+    eyear = eyear.merge(peak_times, on=["event_id", "county_fips"], how="left")
+    eyear["recovery_hr"] = (
+        (eyear["event_end"] - eyear["peak_time"]).dt.total_seconds() / 3600.0
+    )
+
+    eyear["year"] = year
+    event_parts.append(eyear)
+
+    print(f"  outage events built for {year}: {len(eyear):,} "
+          f"({eyear['county_fips'].nunique():,} counties)")
+
+
+events_all = pd.concat(event_parts, ignore_index=True)
+served_year_all = pd.concat(served_year_parts, ignore_index=True)
+
+served_total = (
+    served_year_all.groupby("county_fips", as_index=False)
+    .agg(
+        county_name=("county_name", "first"),
+        state=("state", "first"),
+        max_customers_served_total=("max_customers_served_by_year", "max")
+    )
+)
+
+print(f"\nTotal outage events, 2015-2025: {len(events_all):,}")
+print(f"Counties with outage denominator: {len(served_total):,}")
+
+events_all.to_csv(f"{OUT_DIR}/outage_event_table_2015_2025.csv", index=False)
+served_year_all.to_csv(f"{OUT_DIR}/county_year_customer_denominator_2015_2025.csv", index=False)
+
+
+# ============================================================
+# 2. Read NOAA storm data and build county-level storm table
+# ============================================================
+
+storm_parts = []
+
+for year in YEARS:
+    pattern = f"{STORM_DIR}/StormEvents_details-ftp_v1.0_d{year}_*_clean.csv"
+    matches = glob.glob(pattern)
+
+    if len(matches) == 0:
+        print(f"WARNING: missing storm file for {year}")
+        continue
+
+    storm_path = matches[0]
+    print(f"Reading storm file: {storm_path}")
+
+    sdf = read_csv_safe(storm_path)
+    sdf.columns = [c.strip() for c in sdf.columns]
+
+    required_cols = ["cz_type", "event_type", "start_time", "end_time",
+                     "state_fips", "county_fips"]
+    missing = [c for c in required_cols if c not in sdf.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {storm_path}: {missing}")
+
+    sdf = sdf[sdf["cz_type"].astype(str).str.upper().str.strip() == "C"].copy()
+
+    sdf["county_fips"] = sdf.apply(
+        lambda r: build_storm_fips(r["state_fips"], r["county_fips"]), axis=1
+    )
+    sdf = sdf[sdf["county_fips"].apply(is_conus_fips)].copy()
+
+    sdf["start_time"] = pd.to_datetime(sdf["start_time"], errors="coerce")
+    sdf["end_time"] = pd.to_datetime(sdf["end_time"], errors="coerce")
+    sdf = sdf.dropna(subset=["county_fips", "start_time", "end_time"])
+    sdf["year"] = year
+
+    storm_parts.append(
+        sdf[["county_fips", "year", "event_type", "start_time", "end_time"]].copy()
+    )
+
+storms_all = pd.concat(storm_parts, ignore_index=True)
+print(f"\nTotal county-level NOAA storm records, 2015-2025: {len(storms_all):,}")
+storms_all.to_csv(f"{OUT_DIR}/county_level_storm_records_2015_2025.csv", index=False)
+
+
+# ============================================================
+# 3. Link outage events to storms using +/-6h and +/-12h buffers
+#    (vectorized per county: events x storms broadcast)
+# ============================================================
+
+def link_events_to_storms(events, storms, buffer_hours):
+    """
+    Adds storm_linked_{B}h (bool) and linked_storm_count_{B}h (int).
+    Link rule: same county AND outage interval overlaps storm interval
+    expanded by +/-buffer_hours.
+    """
+    flag_col = f"storm_linked_{buffer_hours}h"
+    cnt_col = f"linked_storm_count_{buffer_hours}h"
+
+    buffer = np.timedelta64(buffer_hours, "h")
+
+    storms_by_fips = {f: g for f, g in storms.groupby("county_fips")}
+
+    linked_parts = []
+    for fips, ev_g in events.groupby("county_fips"):
+        ev_g = ev_g.copy()
+        st_g = storms_by_fips.get(fips)
+
+        if st_g is None or st_g.empty:
+            ev_g[flag_col] = False
+            ev_g[cnt_col] = 0
+            linked_parts.append(ev_g)
+            continue
+
+        st_start = st_g["start_time"].values.astype("datetime64[ns]") - buffer
+        st_end = st_g["end_time"].values.astype("datetime64[ns]") + buffer
+
+        ev_start = ev_g["event_start"].values.astype("datetime64[ns]")
+        ev_end = ev_g["event_end"].values.astype("datetime64[ns]")
+
+        # broadcast: (n_events, n_storms)
+        overlap = (st_start[None, :] <= ev_end[:, None]) & \
+                  (st_end[None, :] >= ev_start[:, None])
+
+        ev_g[flag_col] = overlap.any(axis=1)
+        ev_g[cnt_col] = overlap.sum(axis=1).astype(int)
+        linked_parts.append(ev_g)
+
+    return pd.concat(linked_parts, ignore_index=True)
+
+
+events_linked = link_events_to_storms(events_all, storms_all, buffer_hours=6)
+events_linked = link_events_to_storms(events_linked, storms_all, buffer_hours=12)
+
+events_linked.to_csv(f"{OUT_DIR}/storm_linked_outage_events_2015_2025.csv", index=False)
+
+print("\nStorm-linked outage events:")
+print(events_linked[["storm_linked_6h", "storm_linked_12h"]].sum())
+
+
+# ============================================================
+# 4. County metric comparison builder
+#    FIX 2: counts use .size() (one row = one event), not nunique
+# ============================================================
+
+def build_county_metric_comparison(year=None):
+    """
+    year = int  -> one-year county table
+    year = None -> 2015-2025 aggregate table
+    Burden metrics are based on +/-12h storm-linked outage events.
+    """
+    if year is None:
+        storms = storms_all
+        events = events_linked
+        served_y = served_year_all
+        period_label = "2015_2025"
+
+        denominator = (
+            served_y.groupby("county_fips", as_index=False)
+            .agg(
+                county_name=("county_name", "first"),
+                state=("state", "first"),
+                max_customers_served_by_year=("max_customers_served_by_year", "mean"),
+                max_customers_served_total=("max_customers_served_by_year", "max")
+            )
+        )
+    else:
+        storms = storms_all[storms_all["year"] == year]
+        events = events_linked[events_linked["year"] == year]
+        served_y = served_year_all[served_year_all["year"] == year]
+        period_label = str(year)
+
+        denominator = served_y.copy()
+        denominator["max_customers_served_total"] = denominator["max_customers_served_by_year"]
+
+    # Storm exposure count
+    storm_exposure = (
+        storms.groupby("county_fips").size().reset_index(name="storm_exposure_count")
+    )
+
+    # Storm-linked outage subsets
+    events_12h = events[events["storm_linked_12h"]].copy()
+    events_6h = events[events["storm_linked_6h"]].copy()
+
+    # FIX 2: each row is one (event_id, county, year) event -> .size()
+    outage_count_6h = (
+        events_6h.groupby("county_fips").size()
+        .reset_index(name="outage_event_count_6h")
+    )
+    outage_count_12h = (
+        events_12h.groupby("county_fips").size()
+        .reset_index(name="outage_event_count_12h")
+    )
+
+    outage_metrics = (
+        events_12h.groupby("county_fips")
+        .agg(
+            county_name_from_events=("county_name", "first"),
+            state_from_events=("state", "first"),
+            peak_customers_out_p90=("peak_customers_out", lambda x: x.dropna().quantile(0.90)),
+            total_customer_hours=("auc", "sum"),
+            p90_recovery_hr=("recovery_hr", lambda x: x.dropna().quantile(0.90))
+        )
+        .reset_index()
+    )
+
+    # Merge
+    county_df = denominator.copy()
+    county_df = county_df.merge(storm_exposure, on="county_fips", how="left")
+    county_df = county_df.merge(outage_count_6h, on="county_fips", how="left")
+    county_df = county_df.merge(outage_count_12h, on="county_fips", how="left")
+    county_df = county_df.merge(outage_metrics, on="county_fips", how="left")
+
+    county_df["county_name"] = county_df["county_name"].fillna(
+        county_df.get("county_name_from_events"))
+    county_df["state"] = county_df["state"].fillna(
+        county_df.get("state_from_events"))
+    county_df = county_df.drop(
+        columns=[c for c in ["county_name_from_events", "state_from_events"]
+                 if c in county_df.columns]
+    )
+
+    # Fill missing
+    for c in ["storm_exposure_count", "outage_event_count_6h", "outage_event_count_12h"]:
+        county_df[c] = county_df[c].fillna(0).astype(int)
+
+    county_df["outage_event_count"] = county_df["outage_event_count_12h"]
+
+    for c in ["peak_customers_out_p90", "total_customer_hours", "p90_recovery_hr"]:
+        county_df[c] = county_df[c].fillna(0)
+
+    county_df["max_customers_served_by_year"] = pd.to_numeric(
+        county_df["max_customers_served_by_year"], errors="coerce")
+    county_df["max_customers_served_total"] = pd.to_numeric(
+        county_df["max_customers_served_total"], errors="coerce")
+    county_df.loc[county_df["max_customers_served_total"] <= 0,
+                  "max_customers_served_total"] = np.nan
+
+    # Paper-spec alias
+    county_df["total_customers_served"] = county_df["max_customers_served_total"]
+
+    county_df["normalized_customer_hours"] = (
+        county_df["total_customer_hours"] / county_df["max_customers_served_total"]
+    ).replace([np.inf, -np.inf], np.nan)
+
+    # Percentiles (missing denominator -> burden ranked as zero)
+    county_df["_norm_burden_for_rank"] = county_df["normalized_customer_hours"].fillna(0)
+
+    county_df["exposure_percentile"] = percentile_0_100(county_df["storm_exposure_count"])
+    county_df["burden_percentile"] = percentile_0_100(county_df["_norm_burden_for_rank"])
+    county_df["recovery_percentile"] = percentile_0_100(county_df["p90_recovery_hr"])
+
+    county_df["disproportionate_impact_score"] = (
+        county_df["burden_percentile"] - county_df["exposure_percentile"]
+    )
+
+    # 4-class (2x2) scheme
+    county_df["exposure_impact_class"] = county_df.apply(classify_exposure_impact_4, axis=1)
+
+    # NEW: 4x4 (16-class) quartile scheme
+    county_df["exposure_quartile"] = county_df["exposure_percentile"].apply(quartile_label)
+    county_df["burden_quartile"] = county_df["burden_percentile"].apply(quartile_label)
+    county_df["exposure_impact_class_16"] = (
+        "Exposure " + county_df["exposure_quartile"].astype(str)
+        + " / Burden " + county_df["burden_quartile"].astype(str)
+    )
+
+    county_df["period"] = period_label
+
+    final_cols = [
+        "period", "county_fips", "county_name", "state",
+        "storm_exposure_count",
+        "outage_event_count", "outage_event_count_6h", "outage_event_count_12h",
+        "peak_customers_out_p90", "total_customer_hours",
+        "max_customers_served_by_year", "max_customers_served_total",
+        "total_customers_served",
+        "normalized_customer_hours", "p90_recovery_hr",
+        "exposure_percentile", "burden_percentile", "recovery_percentile",
+        "disproportionate_impact_score",
+        "exposure_impact_class",
+        "exposure_quartile", "burden_quartile", "exposure_impact_class_16",
+    ]
+    county_df = county_df[final_cols].copy()
+
+    county_df = county_df.sort_values(
+        ["disproportionate_impact_score", "normalized_customer_hours"],
+        ascending=[False, False]
+    )
+    return county_df
+
+
+# ============================================================
+# 5. Build and save yearly county metric files
+# ============================================================
+
+yearly_tables = []
+
+for year in YEARS:
+    print(f"\nBuilding county metric comparison for {year}")
+    yearly_df = build_county_metric_comparison(year=year)
+    out_year_csv = f"{YEARLY_OUT_DIR}/county_metric_comparison_{year}.csv"
+    yearly_df.to_csv(out_year_csv, index=False)
+    yearly_tables.append(yearly_df)
+    print(f"Saved: {out_year_csv}  ({len(yearly_df):,} rows)")
+
+yearly_all = pd.concat(yearly_tables, ignore_index=True)
+yearly_all.to_csv(f"{OUT_DIR}/county_metric_comparison_yearly_2015_2025.csv", index=False)
+
+
+# ============================================================
+# 6. 11-year aggregate
+# ============================================================
+
+aggregate_df = build_county_metric_comparison(year=None)
+aggregate_csv = f"{OUT_DIR}/county_metric_comparison_2015_2025.csv"
+aggregate_df.to_csv(aggregate_csv, index=False)
+
+print("\nDone.")
+print(f"Aggregate saved: {aggregate_csv}")
+print(f"Yearly long-format saved: {OUT_DIR}/county_metric_comparison_yearly_2015_2025.csv")
+
+print("\n16-class distribution (aggregate):")
+print(aggregate_df["exposure_impact_class_16"].value_counts().sort_index())
+
+print("\nAggregate preview:")
+print(aggregate_df.head(10))
