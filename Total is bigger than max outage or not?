@@ -1,0 +1,155 @@
+import pandas as pd
+from pathlib import Path
+
+# -----------------------------
+# Paths
+# -----------------------------
+mcc_path = Path(r"D:\Project_3\MCC.csv")
+outage_dir = Path(r"D:\Project_3\Power_Try1")
+
+# -----------------------------
+# Read MCC total customers
+# -----------------------------
+mcc = pd.read_csv(mcc_path)
+mcc.columns = mcc.columns.str.strip()
+
+mcc = mcc[mcc["County_FIPS"].astype(str).str.lower() != "grand total"].copy()
+
+mcc["fips_code"] = (
+    mcc["County_FIPS"]
+    .astype(float)
+    .astype(int)
+    .astype(str)
+    .str.zfill(5)
+)
+
+mcc["MCC_customers"] = pd.to_numeric(mcc["Customers"], errors="coerce")
+mcc = mcc[["fips_code", "MCC_customers"]]
+
+# -----------------------------
+# Process each year separately
+# -----------------------------
+yearly_results = []
+yearly_summary = []
+
+for year in range(2015, 2026):
+    file = outage_dir / f"eaglei_outages_{year}.csv"
+    
+    if not file.exists():
+        print(f"Missing file: {file}")
+        continue
+    
+    print(f"Processing {year}")
+    
+    cols = pd.read_csv(file, nrows=0).columns.str.strip().tolist()
+    
+    outage_col = "customers_out"
+    if "customers_out" not in cols and "sum" in cols:
+        outage_col = "sum"
+    
+    usecols = ["fips_code", "county", "state", outage_col]
+    
+    chunk_summaries = []
+    
+    for chunk in pd.read_csv(file, usecols=usecols, chunksize=1_000_000):
+        chunk.columns = chunk.columns.str.strip()
+        
+        if outage_col == "sum":
+            chunk = chunk.rename(columns={"sum": "customers_out"})
+        
+        chunk["fips_code"] = (
+            chunk["fips_code"]
+            .astype(str)
+            .str.replace(".0", "", regex=False)
+            .str.zfill(5)
+        )
+        
+        chunk["customers_out"] = pd.to_numeric(
+            chunk["customers_out"], errors="coerce"
+        ).fillna(0)
+        
+        part = (
+            chunk.groupby(["fips_code", "county", "state"], as_index=False)
+            .agg(max_customers_out_year=("customers_out", "max"))
+        )
+        
+        chunk_summaries.append(part)
+    
+    # County-level max for this year
+    year_max = pd.concat(chunk_summaries, ignore_index=True)
+    
+    year_max = (
+        year_max.groupby(["fips_code", "county", "state"], as_index=False)
+        .agg(max_customers_out_year=("max_customers_out_year", "max"))
+    )
+    
+    year_max["year"] = year
+    
+    # Merge with MCC
+    year_check = year_max.merge(mcc, on="fips_code", how="left")
+    
+    year_check["MCC_bigger_than_max_outage"] = (
+        year_check["MCC_customers"] > year_check["max_customers_out_year"]
+    )
+    
+    year_check["False_county"] = (
+        year_check["MCC_bigger_than_max_outage"] == False
+    )
+    
+    year_check["difference_MCC_minus_max_outage"] = (
+        year_check["MCC_customers"] - year_check["max_customers_out_year"]
+    )
+    
+    year_check["max_outage_share_of_MCC"] = (
+        year_check["max_customers_out_year"] / year_check["MCC_customers"]
+    )
+    
+    yearly_results.append(year_check)
+    
+    # Summary for this year
+    n_counties = year_check["fips_code"].nunique()
+    n_false = year_check["False_county"].sum()
+    n_true = n_counties - n_false
+    pct_false = 100 * n_false / n_counties
+    
+    yearly_summary.append(
+        {
+            "year": year,
+            "n_counties": n_counties,
+            "n_MCC_bigger_true": n_true,
+            "n_MCC_bigger_false": n_false,
+            "pct_MCC_bigger_false": pct_false
+        }
+    )
+
+# -----------------------------
+# Combine and save
+# -----------------------------
+yearly_all = pd.concat(yearly_results, ignore_index=True)
+summary = pd.DataFrame(yearly_summary)
+
+# Counties that are false in each year
+yearly_false = yearly_all[yearly_all["False_county"]].copy()
+
+summary.to_csv(
+    r"D:\Project_3\yearly_false_count_summary_MCC_vs_outage_2015_2025.csv",
+    index=False
+)
+
+yearly_all.to_csv(
+    r"D:\Project_3\yearly_MCC_vs_outage_all_counties_2015_2025.csv",
+    index=False
+)
+
+yearly_false.to_csv(
+    r"D:\Project_3\yearly_false_counties_MCC_smaller_than_outage_2015_2025.csv",
+    index=False
+)
+
+print("\nYearly summary:")
+print(summary)
+
+print("\nSaved:")
+print(r"D:\Project_3\yearly_false_count_summary_MCC_vs_outage_2015_2025.csv")
+print(r"D:\Project_3\yearly_MCC_vs_outage_all_counties_2015_2025.csv")
+print(r"D:\Project_3\yearly_false_counties_MCC_smaller_than_outage_2015_2025.csv")
