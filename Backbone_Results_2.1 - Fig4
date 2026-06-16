@@ -183,3 +183,118 @@ fig.savefig(OUT_FIG, dpi=DPI, bbox_inches="tight")
 plt.close(fig)
 
 print(f"Saved figure: {OUT_FIG}")
+
+
+
+
+
+# ============================================================
+# FIGURE — CLEANER YEAR-WISE TOP 10% BURDEN SHARE
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(9.5, 5.2))
+
+x = summary["year"].values
+y = summary["top10_burden_share_pct"].values
+
+line_color = "#54278f"
+fill_color = "#dadaeb"
+
+# Mean line
+mean_y = np.nanmean(y)
+
+ax.axhline(
+    mean_y,
+    color="gray",
+    lw=1.2,
+    ls="--",
+    alpha=0.7,
+    zorder=1
+)
+
+# Light band around the observed range
+ax.fill_between(
+    x,
+    y,
+    mean_y,
+    color=fill_color,
+    alpha=0.45,
+    zorder=2
+)
+
+# Main line
+ax.plot(
+    x,
+    y,
+    color=line_color,
+    lw=2.8,
+    marker="o",
+    markersize=6.5,
+    markerfacecolor="white",
+    markeredgecolor=line_color,
+    markeredgewidth=2,
+    zorder=3
+)
+
+# Value labels — smaller and closer to points
+for xi, yi in zip(x, y):
+    ax.text(
+        xi,
+        yi + 1.2,
+        f"{yi:.0f}",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color=line_color
+    )
+
+# Mean label
+ax.text(
+    x[-1] + 0.15,
+    mean_y,
+    f"Mean = {mean_y:.0f}%",
+    va="center",
+    ha="left",
+    fontsize=9,
+    color="gray"
+)
+
+# Axes
+ax.set_xlabel("Year")
+ax.set_ylabel("Top 10% burden share (%)")
+
+ax.set_title(
+    "Persistence of outage-burden concentration, 2015–2025\n"
+    "Top 10% of counties hold most annual customer-hour burden",
+    fontsize=14,
+    pad=12
+)
+
+# Better y-axis range because all values are high
+ymin = max(0, np.nanmin(y) - 8)
+ymax = min(100, np.nanmax(y) + 8)
+
+ax.set_ylim(ymin, ymax)
+ax.set_xlim(x.min() - 0.5, x.max() + 0.7)
+
+ax.set_xticks(x)
+ax.set_yticks(np.arange(70, 101, 5))
+
+# Clean style
+ax.grid(axis="y", alpha=0.18, linewidth=0.8)
+ax.grid(axis="x", visible=False)
+
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+ax.spines["left"].set_linewidth(1.0)
+ax.spines["bottom"].set_linewidth(1.0)
+
+ax.tick_params(axis="both", direction="out", length=4, width=0.9)
+
+fig.tight_layout()
+
+fig.savefig(OUT_FIG, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
+
+print(f"Saved figure: {OUT_FIG}")
