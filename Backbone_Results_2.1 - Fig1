@@ -1,0 +1,145 @@
+# ============================================================
+# FIGURES 2 & 3 — yearly curves summarized as mean + shaded range
+# ============================================================
+
+years = sorted(int(p) for p in county["period"].unique() if str(p).isdigit())
+
+# Common x-axis for averaging/interpolation
+common_x = np.linspace(0, 100, 501)
+
+for metric in METRICS:
+    fig, ax = plt.subplots(figsize=(8.5, 8))
+
+    # Line of equality
+    ax.plot(
+        [0, 100], [0, 100],
+        ls="--", lw=1.2, color="black", alpha=0.7,
+        label="Line of equality"
+    )
+
+    yearly_y = []
+    ginis = []
+
+    for yr in years:
+        sub = county[county["period"] == str(yr)]
+        cx, cy, n = lorenz_xy(sub[metric])
+
+        if cx is None:
+            continue
+
+        # Interpolate each yearly Lorenz curve onto common x-axis
+        cy_interp = np.interp(common_x, cx, cy)
+        yearly_y.append(cy_interp)
+
+        ginis.append(gini_of(str(yr), metric))
+
+    yearly_y = np.array(yearly_y)
+
+    # Mean and uncertainty/range band
+    mean_y = np.nanmean(yearly_y, axis=0)
+    min_y = np.nanmin(yearly_y, axis=0)
+    max_y = np.nanmax(yearly_y, axis=0)
+
+    # Optional: use percentile band instead of min-max
+    # lower_y = np.nanpercentile(yearly_y, 10, axis=0)
+    # upper_y = np.nanpercentile(yearly_y, 90, axis=0)
+
+    color = METRIC_COLOR[metric]
+
+    ax.fill_between(
+        common_x, min_y, max_y,
+        color=color, alpha=0.20,
+        label="Range across years"
+    )
+
+    ax.plot(
+        common_x, mean_y,
+        color=color, lw=2.6,
+        label="Mean yearly curve"
+    )
+
+    gmin, gmax = (np.nanmin(ginis), np.nanmax(ginis)) if ginis else (np.nan, np.nan)
+    gmean = np.nanmean(ginis) if ginis else np.nan
+
+    ax.set_xlabel("Cumulative share of counties (%)  —  ranked highest burden first")
+    ax.set_ylabel("Cumulative share of total burden (%)")
+    ax.set_title(
+        f"{METRIC_SHORT[metric]} — mean cumulative burden curve\n"
+        f"Range = {gmin:.2f}-{gmax:.2f}"
+    )
+
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.set_aspect("equal")
+
+    fig.tight_layout()
+
+    tag = "absolute" if metric == "customer_hour_burden" else "normalized"
+    fig.savefig(f"{FIG_DIR}/fig_lorenz_by_year_{tag}.png", dpi=DPI)
+    plt.close(fig)
+
+    print(f"Saved fig_lorenz_by_year_{tag}")
+
+
+
+
+
+
+
+
+
+# ============================================================
+# FIGURE 1 — pooled 2015-2025, both metrics on one axis
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(8.5, 8))
+
+ax.plot(
+    [0, 100], [0, 100],
+    ls="--", lw=1.2, color="black", alpha=0.7,
+    label="Line of equality"
+)
+
+for metric, color in METRIC_COLOR.items():
+    sub = county[county["period"] == "2015_2025"]
+    cx, cy, n = lorenz_xy(sub[metric])
+
+    if cx is None:
+        continue
+
+    g = gini_of("2015_2025", metric)
+
+    ax.plot(
+        cx, cy,
+        lw=2.4,
+        color=color,
+        label=f"{METRIC_SHORT[metric]} (Gini = {g:.2f})"
+    )
+
+    # Optional: keep the top-10% point but remove text annotation
+    # t10 = top_share("2015_2025", metric, "top10pct_share")
+    # ax.plot(10, t10, "o", color=color, ms=7, zorder=5)
+
+ax.set_xlabel("Cumulative share of counties (%)  —  ranked highest burden first")
+ax.set_ylabel("Cumulative share of total burden (%)")
+
+ax.set_title(
+    "Cumulative burden (Lorenz) curve, pooled 2015-2025"
+)
+
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 100)
+
+ax.legend(loc="lower right", fontsize=9, framealpha=0.95)
+ax.grid(alpha=0.3)
+ax.set_aspect("equal")
+
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_lorenz_pooled_both.png", dpi=DPI)
+plt.close(fig)
+
+print("Saved fig_lorenz_pooled_both")
+
+    
