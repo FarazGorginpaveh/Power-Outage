@@ -1,0 +1,254 @@
+"""
+Q2 Figure — Burden share by county group, pooled 2015-2025
+==========================================================
+Creates only one vertical grouped bar chart:
+
+    fig_burden_share_groups_pooled.png
+
+Shows share of total customer-hour burden held by:
+    Top 1%, Top 5%, Top 10%, Bottom 50%
+
+for both:
+    Absolute customer-hour burden
+    Normalized customer-hour burden
+
+Reads from:
+    Results/Q2/q2_county_burden_by_year.csv
+
+Writes to:
+    Results/Q2/figures/fig_burden_share_groups_pooled.png
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q2"
+FIG_DIR = f"{Q2}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+COUNTY_CSV = f"{Q2}/q2_county_burden_by_year.csv"
+
+DPI = 300
+
+# ============================================================
+# STYLE
+# ============================================================
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+METRIC_COLOR = {
+    "customer_hour_burden": "#b2182b",
+    "normalized_customer_hour_burden": "#2166ac",
+}
+
+GROUPS = [
+    ("Top 1%", 0.01, True),
+    ("Top 5%", 0.05, True),
+    ("Top 10%", 0.10, True),
+    ("Bottom 50%", 0.50, False),
+]
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+county = pd.read_csv(COUNTY_CSV, dtype={"county_fips": str, "period": str})
+pooled = county[county["period"] == "2015_2025"].copy()
+
+
+def group_share(values, frac, take_top):
+    """
+    Share (%) of total burden held by the top or bottom fraction of counties,
+    ranked by burden descending.
+    """
+    x = pd.to_numeric(pd.Series(values), errors="coerce").dropna().values
+
+    if x.size == 0 or x.sum() == 0:
+        return np.nan
+
+    x = np.sort(x)[::-1]
+    k = max(1, int(np.ceil(frac * x.size)))
+
+    selected = x[:k] if take_top else x[-k:]
+
+    return float(selected.sum() / x.sum() * 100.0)
+
+
+# ============================================================
+# CALCULATE SHARES
+# ============================================================
+
+labels = [g[0] for g in GROUPS]
+xpos = np.arange(len(labels))
+
+shares_abs = [
+    group_share(pooled["customer_hour_burden"], frac, take_top)
+    for _, frac, take_top in GROUPS
+]
+
+shares_norm = [
+    group_share(pooled["normalized_customer_hour_burden"], frac, take_top)
+    for _, frac, take_top in GROUPS
+]
+
+# ============================================================
+# FIGURE — VERTICAL GROUPED BAR CHART
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(9.5, 6.2))
+
+bar_width = 0.22
+gap = 0.02
+
+ax.bar(
+    xpos - bar_width / 2 - gap / 2,
+    shares_abs,
+    width=bar_width,
+    color=METRIC_COLOR["customer_hour_burden"],
+    alpha=0.92,
+    label="Absolute burden"
+)
+
+ax.bar(
+    xpos + bar_width / 2 + gap / 2,
+    shares_norm,
+    width=bar_width,
+    color=METRIC_COLOR["normalized_customer_hour_burden"],
+    alpha=0.92,
+    label="Normalized burden"
+)
+
+# ============================================================
+# AXES AND LABELS
+# ============================================================
+
+ax.set_xticks(xpos)
+ax.set_xticklabels(labels)
+
+ax.set_ylabel("Share of total customer-hour burden (%)")
+ax.set_xlabel("County group ranked by burden")
+
+ax.set_ylim(0, 100)
+
+ax.set_title(
+    "Concentration of outage burden across counties, pooled 2015–2025"
+)
+
+# ============================================================
+# CLEAN STYLE
+# ============================================================
+
+# Remove grids
+ax.grid(False)
+
+# Remove top and right spines
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+# Keep axes connected normally
+ax.spines["left"].set_position(("outward", 0))
+ax.spines["bottom"].set_position(("outward", 0))
+
+# Left axis starts at 0 and ends at 100
+ax.spines["left"].set_bounds(0, 100)
+
+# Bottom axis starts close to y-axis and continues after the last bars
+x_axis_start = -0.55
+x_axis_end = xpos[-1] + 0.45
+
+ax.spines["bottom"].set_bounds(x_axis_start, x_axis_end)
+
+# Control x-axis limits
+ax.set_xlim(-0.58, xpos[-1] + 0.62)
+
+# Regular tick marks for category labels
+ax.tick_params(
+    axis="both",
+    length=5,
+    width=0.9,
+    direction="out"
+)
+
+# ============================================================
+# ADD END TICKS TO X-AXIS
+# ============================================================
+
+# This transform uses x in data coordinates and y in axes coordinates.
+# y=0 is exactly the x-axis. Negative y draws ticks outward/downward.
+xaxis_transform = ax.get_xaxis_transform()
+
+end_tick_length = 0.018
+
+for x_tick in [x_axis_start, x_axis_end]:
+    ax.plot(
+        [x_tick, x_tick],
+        [0, -end_tick_length],
+        transform=xaxis_transform,
+        color="black",
+        lw=0.9,
+        clip_on=False,
+        solid_capstyle="butt"
+    )
+
+# Legend
+ax.legend(
+    loc="upper right",
+    frameon=True,
+    framealpha=0.95,
+    edgecolor="0.85"
+)
+
+fig.tight_layout()
+
+out_path = f"{FIG_DIR}/fig_burden_share_groups_pooled.png"
+fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
+
+print(f"Saved: {out_path}")
+
+# ============================================================
+# CONSOLE TABLE
+# ============================================================
+
+print("\nPooled 2015–2025 burden shares (%):")
+
+rows = [
+    {
+        "metric": "Absolute burden",
+        "Top 1%": round(shares_abs[0], 1),
+        "Top 5%": round(shares_abs[1], 1),
+        "Top 10%": round(shares_abs[2], 1),
+        "Bottom 50%": round(shares_abs[3], 1),
+    },
+    {
+        "metric": "Normalized burden",
+        "Top 1%": round(shares_norm[0], 1),
+        "Top 5%": round(shares_norm[1], 1),
+        "Top 10%": round(shares_norm[2], 1),
+        "Bottom 50%": round(shares_norm[3], 1),
+    },
+]
+
+print(pd.DataFrame(rows).to_string(index=False))
+print(f"\nFigure written to: {FIG_DIR}")
