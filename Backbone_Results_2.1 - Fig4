@@ -1,0 +1,185 @@
+"""
+Q2 — Year-wise top 10% burden share
+===================================
+Purpose:
+Check whether outage burden concentration is persistent across years.
+
+For each year:
+    Top 10% burden share =
+        customer-hours from top 10% counties / total customer-hours in that year
+
+Reads:
+    Results/Q2/q2_county_burden_by_year.csv
+
+Writes:
+    Results/Q2/q2_top10_burden_share_by_year.csv
+    Results/Q2/figures/fig_top10_burden_share_by_year.png
+
+Requires:
+    pandas, numpy, matplotlib
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q2"
+FIG_DIR = f"{Q2}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+COUNTY_CSV = f"{Q2}/q2_county_burden_by_year.csv"
+
+OUT_CSV = f"{Q2}/q2_top10_burden_share_by_year.csv"
+OUT_FIG = f"{FIG_DIR}/fig_top10_burden_share_by_year.png"
+
+DPI = 300
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BURDEN_COL = "customer_hour_burden"
+TOP_FRAC = 0.10
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+county = pd.read_csv(
+    COUNTY_CSV,
+    dtype={"county_fips": str, "period": str}
+)
+
+county["county_fips"] = county["county_fips"].str.zfill(5)
+county[BURDEN_COL] = pd.to_numeric(county[BURDEN_COL], errors="coerce").fillna(0)
+
+# Keep only yearly rows, excluding pooled 2015_2025
+yearly = county[county["period"].str.isdigit()].copy()
+yearly["year"] = yearly["period"].astype(int)
+
+# ============================================================
+# FUNCTION
+# ============================================================
+
+def top10_share_for_year(df, burden_col=BURDEN_COL, top_frac=TOP_FRAC):
+    """
+    Calculate the share of total burden held by the top 10% counties
+    for one year.
+    """
+    x = df[burden_col].dropna().astype(float)
+
+    total_burden = x.sum()
+    n_counties = len(x)
+
+    if n_counties == 0 or total_burden == 0:
+        return pd.Series({
+            "n_counties": n_counties,
+            "n_top10_counties": np.nan,
+            "total_customer_hours": total_burden,
+            "top10_customer_hours": np.nan,
+            "top10_burden_share": np.nan,
+            "top10_burden_share_pct": np.nan
+        })
+
+    k = max(1, int(np.ceil(top_frac * n_counties)))
+
+    top10_burden = x.sort_values(ascending=False).head(k).sum()
+    share = top10_burden / total_burden
+
+    return pd.Series({
+        "n_counties": n_counties,
+        "n_top10_counties": k,
+        "total_customer_hours": total_burden,
+        "top10_customer_hours": top10_burden,
+        "top10_burden_share": share,
+        "top10_burden_share_pct": share * 100
+    })
+
+
+# ============================================================
+# CALCULATE YEAR-WISE TOP 10% SHARE
+# ============================================================
+
+summary = (
+    yearly
+    .groupby("year", as_index=False)
+    .apply(top10_share_for_year)
+    .reset_index(drop=True)
+)
+
+summary = summary.sort_values("year")
+
+summary.to_csv(OUT_CSV, index=False)
+
+print("\nYear-wise top 10% burden share:")
+print(summary.to_string(index=False))
+
+print(f"\nSaved CSV: {OUT_CSV}")
+
+# ============================================================
+# FIGURE
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(9, 5.5))
+
+ax.plot(
+    summary["year"],
+    summary["top10_burden_share_pct"],
+    marker="o",
+    linewidth=2.2,
+    markersize=5.5,
+    color="#54278f"
+)
+
+ax.set_xlabel("Year")
+ax.set_ylabel("Top 10% burden share (%)")
+
+ax.set_title(
+    "Year-wise concentration of outage burden\n"
+    "Share of annual customer-hour burden held by the top 10% counties"
+)
+
+ax.set_ylim(0, 100)
+ax.set_xticks(summary["year"])
+
+ax.grid(axis="y", alpha=0.25)
+
+# Add labels above points
+for _, row in summary.iterrows():
+    ax.text(
+        row["year"],
+        row["top10_burden_share_pct"] + 1.5,
+        f"{row['top10_burden_share_pct']:.0f}%",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color="#54278f"
+    )
+
+fig.tight_layout()
+fig.savefig(OUT_FIG, dpi=DPI, bbox_inches="tight")
+plt.close(fig)
+
+print(f"Saved figure: {OUT_FIG}")
