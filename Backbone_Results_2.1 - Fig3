@@ -1,0 +1,314 @@
+"""
+Q2 Figures — Maps of absolute and normalized customer-hour burden
+=================================================================
+
+Creates two CONUS county-level maps for pooled 2015–2025:
+
+1. Map of absolute customer-hour burden
+   Purpose:
+       Show where total system-scale outage burden is concentrated.
+   Metric:
+       customer_hour_burden
+
+2. Map of normalized customer-hour burden
+   Purpose:
+       Show where outage burden is high relative to the number of customers served.
+       This avoids dominance by large-population or large-customer counties.
+   Metric:
+       normalized_customer_hour_burden
+
+Reads:
+    Results/Q2/q2_county_burden_by_year.csv
+    shapefile cb_2022_us_county_5m.shp
+
+Writes:
+    Results/Q2/figures/fig_map_absolute_customer_hour_burden.png
+    Results/Q2/figures/fig_map_normalized_customer_hour_burden.png
+
+Requires:
+    pandas, numpy, matplotlib, geopandas
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm, LogNorm
+import geopandas as gpd
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q2"
+FIG_DIR = f"{Q2}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+COUNTY_CSV = f"{Q2}/q2_county_burden_by_year.csv"
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+PERIOD = "2015_2025"
+
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+
+MISSING_COLOR = "#d9d9d9"
+EDGE_COLOR = "white"
+DPI = 300
+
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "font.size": 11,
+    "axes.titlesize": 15,
+})
+
+# ============================================================
+# COLOR MAPS
+# ============================================================
+
+# Same red used in fig_burden_share_groups_pooled.png:
+# customer_hour_burden = "#b2182b"
+absolute_cmap = LinearSegmentedColormap.from_list(
+    "absolute_gray_burgundy",
+    [
+        "#f7f7f7",  # very low
+        "#e0e0e0",  # low
+        "#cccccc",  # low-mid
+        "#f6d0c9",  # pale coral
+        "#e9a39a",  # soft salmon
+        "#d36f6a",  # muted coral
+        "#b54656",  # rose-burgundy
+        "#7f1d3a"   # deep burgundy
+    ],
+    N=256
+)
+
+# Same blue used in fig_burden_share_groups_pooled.png:
+# normalized_customer_hour_burden = "#2166ac"
+normalized_cmap = LinearSegmentedColormap.from_list(
+    "normalized_gray_blue",
+    [
+        "#f7f7f7",  # very low
+        "#e0e0e0",  # low
+        "#cccccc",  # low-mid
+        "#c6dbef",  # light blue
+        "#9ecae1",  # medium-light blue
+        "#6baed6",  # medium blue
+        "#4292c6",  # strong blue
+        "#2166ac"   # high
+    ],
+    N=256
+)
+
+# ============================================================
+# LOAD COUNTY BURDEN DATA
+# ============================================================
+
+county = pd.read_csv(
+    COUNTY_CSV,
+    dtype={
+        "county_fips": str,
+        "period": str
+    }
+)
+
+county["county_fips"] = county["county_fips"].str.zfill(5)
+
+d = county[county["period"] == PERIOD][
+    [
+        "county_fips",
+        "county_name",
+        "state",
+        "customer_hour_burden",
+        "normalized_customer_hour_burden"
+    ]
+].copy()
+
+d["customer_hour_burden"] = pd.to_numeric(
+    d["customer_hour_burden"],
+    errors="coerce"
+)
+
+d["normalized_customer_hour_burden"] = pd.to_numeric(
+    d["normalized_customer_hour_burden"],
+    errors="coerce"
+)
+
+d["absolute_burden_percentile"] = (
+    d["customer_hour_burden"].rank(pct=True) * 100
+)
+
+d["normalized_burden_percentile"] = (
+    d["normalized_customer_hour_burden"].rank(pct=True) * 100
+)
+
+# ============================================================
+# LOAD COUNTY SHAPEFILE
+# ============================================================
+
+gdf = gpd.read_file(SHP_PATH)
+
+gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+
+# Keep CONUS only
+gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+
+# Project to CONUS Albers Equal Area
+gdf = gdf.to_crs("EPSG:5070")
+
+# Merge burden data with county geometry
+geo = gdf.merge(d, on="county_fips", how="left")
+
+print(f"CONUS counties in shapefile: {len(gdf):,}")
+print(f"Counties matched with burden data: {geo['customer_hour_burden'].notna().sum():,}")
+
+# ============================================================
+# HELPER FUNCTION
+# ============================================================
+
+def make_map(
+    geo,
+    column,
+    cmap,
+    norm,
+    title,
+    subtitle,
+    legend_label,
+    out_path
+):
+    """
+    Create one CONUS county choropleth map with a horizontal colorbar below.
+    """
+    fig, ax = plt.subplots(figsize=(13, 8.5))
+
+    geo.plot(
+        column=column,
+        cmap=cmap,
+        norm=norm,
+        linewidth=0.04,
+        edgecolor=EDGE_COLOR,
+        legend=True,
+        ax=ax,
+        missing_kwds={
+            "color": MISSING_COLOR,
+            "label": "No data"
+        },
+        legend_kwds={
+            "orientation": "horizontal",
+            "shrink": 0.55,
+            "pad": 0.03,
+            "fraction": 0.045,
+            "label": legend_label,
+            "extend": "max"
+        }
+    )
+
+    ax.set_axis_off()
+
+    ax.set_title(
+        f"{title}\n{subtitle}",
+        fontsize=15,
+        pad=12
+    )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {out_path}")
+
+# ============================================================
+# MAP 1 — ABSOLUTE CUSTOMER-HOUR BURDEN
+# ============================================================
+
+abs_vals = geo["customer_hour_burden"].dropna()
+abs_pos = abs_vals[abs_vals > 0]
+
+# Absolute customer-hours are right-skewed.
+# LogNorm makes the spatial pattern readable while preserving total-burden meaning.
+abs_vmin = max(abs_pos.quantile(0.02), 1)
+abs_vmax = abs_pos.quantile(0.98)
+
+abs_norm = LogNorm(
+    vmin=abs_vmin,
+    vmax=abs_vmax
+)
+
+make_map(
+    geo=geo,
+    column="customer_hour_burden",
+    cmap=absolute_cmap,
+    norm=abs_norm,
+    title="Absolute customer-hour burden by county, 2015–2025",
+    subtitle="Total system-scale outage burden",
+    legend_label="Total customer-hours, log scale",
+    out_path=f"{FIG_DIR}/fig_map_absolute_customer_hour_burden.png"
+)
+
+# ============================================================
+# MAP 2 — NORMALIZED CUSTOMER-HOUR BURDEN
+# ============================================================
+
+norm_vals = geo["normalized_customer_hour_burden"].dropna()
+
+# Normalized burden is not a percentage and can exceed 100.
+# PowerNorm improves contrast among low and middle values.
+norm_vmin = 0
+norm_vmax = norm_vals.quantile(0.98)
+
+normalized_norm = PowerNorm(
+    gamma=0.55,
+    vmin=norm_vmin,
+    vmax=norm_vmax
+)
+
+make_map(
+    geo=geo,
+    column="normalized_customer_hour_burden",
+    cmap=normalized_cmap,
+    norm=normalized_norm,
+    title="Normalized customer-hour burden by county, 2015–2025",
+    subtitle="Outage burden relative to the number of customers served",
+    legend_label="Normalized customer-hour burden",
+    out_path=f"{FIG_DIR}/fig_map_normalized_customer_hour_burden.png"
+)
+
+# ============================================================
+# CONSOLE TABLES
+# ============================================================
+
+top_abs = d.nlargest(15, "customer_hour_burden")[
+    [
+        "county_fips",
+        "county_name",
+        "state",
+        "customer_hour_burden",
+        "absolute_burden_percentile"
+    ]
+]
+
+top_norm = d.nlargest(15, "normalized_customer_hour_burden")[
+    [
+        "county_fips",
+        "county_name",
+        "state",
+        "normalized_customer_hour_burden",
+        "normalized_burden_percentile"
+    ]
+]
+
+print("\nTop 15 counties by absolute customer-hour burden:")
+print(top_abs.to_string(index=False))
+
+print("\nTop 15 counties by normalized customer-hour burden:")
+print(top_norm.to_string(index=False))
+
+print(f"\nFigures written to: {FIG_DIR}")
