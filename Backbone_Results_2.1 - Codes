@@ -1,0 +1,226 @@
+"""
+Q2 — Is realized infrastructure impact broadly distributed or concentrated?
+===========================================================================
+Concentration / inequality analysis of outage burden across counties, using
+the cap1 MCC-normalization (counties with MCC < peak customers-out are kept
+with normalized burden capped at 1).
+
+Two burden metrics (per the research question):
+  customer_hour_burden            = total_customer_hours
+                                    ( = sum(customers out) * duration[hr] )
+  normalized_customer_hour_burden = total_customer_hours / total_customers_served
+                                    (total customers served = MCC customers;
+                                     capped at 1 for flagged counties)
+
+Computed for every year 2015-2025 AND a pooled 2015-2025 row.
+
+Outputs (in Results/Q2):
+  q2_county_burden_by_year.csv
+      one row per (period, county): both burden metrics, MCC denominator,
+      flag, plus within-period descending rank and cumulative top-down share
+      of each metric  (raw material for Lorenz / concentration figures)
+  q2_concentration_summary_by_year.csv
+      one row per (period, metric): n counties, total, mean/median, Gini,
+      top 1/5/10/20% shares, counties (and % of counties) needed to reach
+      50/80/90% of total burden, CV, max, p90, p99
+      ( the table that answers "broad vs concentrated" )
+
+Requires: pandas, numpy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# Paths / parameters
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q2"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+AGG_CSV = f"{Q1_3}/county_metric_comparison_2015_2025.csv"
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+
+FLAG_MODE = "peak"   # cap1 flag: MCC < peak_customers_out_p90  (count vs count)
+
+
+# ============================================================
+# Concentration helpers
+# ============================================================
+
+def gini(values):
+    """Gini coefficient for non-negative values. 0 = perfectly equal (broad),
+    1 = all burden in one county (maximally concentrated)."""
+    x = np.sort(np.asarray(values, dtype=float))
+    x = x[~np.isnan(x)]
+    if x.size == 0:
+        return np.nan
+    if (x < 0).any():
+        x = x - x.min()
+    total = x.sum()
+    if total == 0:
+        return np.nan
+    n = x.size
+    idx = np.arange(1, n + 1)
+    return float((2.0 * np.sum(idx * x)) / (n * total) - (n + 1.0) / n)
+
+
+def top_k_share(values, k_frac):
+    """Share of total burden held by the top k_frac of counties (by burden)."""
+    x = np.asarray(values, dtype=float)
+    x = x[~np.isnan(x)]
+    if x.size == 0 or x.sum() == 0:
+        return np.nan
+    x = np.sort(x)[::-1]
+    k = max(1, int(np.ceil(k_frac * x.size)))
+    return float(x[:k].sum() / x.sum() * 100.0)
+
+
+def counties_to_threshold(values, thresh_frac):
+    """How many counties (and what % of counties) account for thresh_frac of
+    total burden, taking the largest-burden counties first."""
+    x = np.asarray(values, dtype=float)
+    x = x[~np.isnan(x)]
+    if x.size == 0 or x.sum() == 0:
+        return np.nan, np.nan
+    x = np.sort(x)[::-1]
+    cum = np.cumsum(x) / x.sum()
+    k = int(np.searchsorted(cum, thresh_frac) + 1)
+    k = min(k, x.size)
+    return k, float(k / x.size * 100.0)
+
+
+def summarize(values, period, metric_name):
+    x = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    n_total = int(x.size)
+    n_pos = int((x > 0).sum())
+    total = float(x.sum())
+    row = {
+        "period": period,
+        "metric": metric_name,
+        "n_counties": n_total,
+        "n_counties_positive": n_pos,
+        "total_burden": total,
+        "mean": float(x.mean()) if n_total else np.nan,
+        "median": float(x.median()) if n_total else np.nan,
+        "gini": gini(x.values),
+        "top1pct_share": top_k_share(x.values, 0.01),
+        "top5pct_share": top_k_share(x.values, 0.05),
+        "top10pct_share": top_k_share(x.values, 0.10),
+        "top20pct_share": top_k_share(x.values, 0.20),
+        "cv": float(x.std() / x.mean()) if n_total and x.mean() else np.nan,
+        "max": float(x.max()) if n_total else np.nan,
+        "p90": float(x.quantile(0.90)) if n_total else np.nan,
+        "p99": float(x.quantile(0.99)) if n_total else np.nan,
+    }
+    for thr in (0.50, 0.80, 0.90):
+        k, kpct = counties_to_threshold(x.values, thr)
+        row[f"counties_to_{int(thr * 100)}pct"] = k
+        row[f"counties_to_{int(thr * 100)}pct_share_of_counties"] = kpct
+    return row
+
+
+# ============================================================
+# Load + apply cap1 MCC normalization
+# ============================================================
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")          # drops 'Grand Total' etc.
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def apply_cap1(d, mcc_map):
+    d = d.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+    d["mcc_customers"] = pd.to_numeric(d["county_fips"].map(mcc_map), errors="coerce")
+    d.loc[d["mcc_customers"] <= 0, "mcc_customers"] = np.nan
+
+    d["customer_hour_burden"] = pd.to_numeric(d["total_customer_hours"],
+                                              errors="coerce")
+    peak = pd.to_numeric(d["peak_customers_out_p90"], errors="coerce")
+    d["mcc_flag"] = (d["mcc_customers"] < peak).fillna(False)
+
+    d["normalized_customer_hour_burden"] = (
+        d["customer_hour_burden"] / d["mcc_customers"]
+    ).replace([np.inf, -np.inf], np.nan)
+    d.loc[d["mcc_flag"], "normalized_customer_hour_burden"] = 1.0
+    return d
+
+
+mcc_map = load_mcc(MCC_CSV)
+print(f"MCC counties: {len(mcc_map):,}")
+
+agg = pd.read_csv(AGG_CSV, dtype={"county_fips": str})
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+
+agg = apply_cap1(agg, mcc_map)
+yearly = apply_cap1(yearly, mcc_map)
+
+keep_cols = ["county_fips", "county_name", "state",
+             "customer_hour_burden", "normalized_customer_hour_burden",
+             "mcc_customers", "mcc_flag"]
+
+# ============================================================
+# Build per-county-by-year table + concentration summary
+# ============================================================
+
+metrics = ["customer_hour_burden", "normalized_customer_hour_burden"]
+
+county_rows = []
+summary_rows = []
+
+# per-year
+years = sorted(int(p) for p in yearly["period"].unique() if str(p).isdigit())
+for yr in years:
+    g = yearly[yearly["period"] == str(yr)].copy()
+    block = g[keep_cols].copy()
+    block.insert(0, "period", str(yr))
+    for met in metrics:
+        block[f"{met}_rank"] = block[met].rank(ascending=False, method="min")
+        s = block[met].fillna(0)
+        order = s.sort_values(ascending=False)
+        cum = order.cumsum() / order.sum() if order.sum() else order * 0
+        block[f"{met}_cum_top_share"] = block.index.map(cum) * 100
+        summary_rows.append(summarize(block[met], str(yr), met))
+    county_rows.append(block)
+
+# pooled 2015-2025 (from aggregate cap1)
+block = agg[keep_cols].copy()
+block.insert(0, "period", "2015_2025")
+for met in metrics:
+    block[f"{met}_rank"] = block[met].rank(ascending=False, method="min")
+    s = block[met].fillna(0)
+    order = s.sort_values(ascending=False)
+    cum = order.cumsum() / order.sum() if order.sum() else order * 0
+    block[f"{met}_cum_top_share"] = block.index.map(cum) * 100
+    summary_rows.append(summarize(block[met], "2015_2025", met))
+county_rows.append(block)
+
+county_table = pd.concat(county_rows, ignore_index=True)
+summary_table = pd.DataFrame(summary_rows)
+
+county_csv = f"{OUT_DIR}/q2_county_burden_by_year.csv"
+summary_csv = f"{OUT_DIR}/q2_concentration_summary_by_year.csv"
+county_table.to_csv(county_csv, index=False)
+summary_table.to_csv(summary_csv, index=False)
+
+print(f"\nWrote:\n  {county_csv}  ({len(county_table):,} rows)")
+print(f"  {summary_csv}  ({len(summary_table):,} rows)")
+
+print("\nConcentration summary (key columns):")
+show = summary_table[["period", "metric", "n_counties", "gini",
+                      "top10pct_share", "counties_to_50pct",
+                      "counties_to_50pct_share_of_counties"]]
+with pd.option_context("display.width", 140, "display.max_columns", None):
+    print(show.to_string(index=False))
