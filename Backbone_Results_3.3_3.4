@@ -1,0 +1,137 @@
+"""
+Section 3.3 — Recovery persistence component  (main risk dimension)
+Section 3.4 — Peak outage variable             (SENSITIVITY only)
+===================================================================
+3.3 Recovery persistence:
+    D_c   = P90(recovery duration of storm-associated outage events in county c)
+          ( = p90_recovery_hr, already computed in the pipeline )
+    D_c*  = Pctl(D_c) in [0, 100]      -- upper-tail restoration persistence
+
+3.4 Peak outage (sensitivity variable, NOT a main risk component):
+    P_c   = P90(peak customers out)            ( = peak_customers_out_p90 )
+    P_c*  = Pctl(P_c)
+    Also a cap1-consistent fraction flavor:
+    P_c_frac  = min( peak_customers_out_p90 / MCC , 1 )    -- peak outage fraction
+    P_c_frac* = Pctl(P_c_frac)
+    Use ONLY for the peak-inclusion sensitivity experiment.
+
+Both computed for each year 2015-2025 and pooled 2015-2025. Counties with no
+storm-linked outages carry 0 and rank at the bottom (pipeline convention).
+Percentile = average-rank * 100 (ties share a rank).
+
+Reads (canonical, from Q1_3) + MCC.csv. Writes to Results/Q3:
+    recovery_component_by_period.csv      + by_period/recovery_component_{period}.csv
+    peak_sensitivity_by_period.csv        + by_period/peak_sensitivity_{period}.csv
+
+Requires: pandas, numpy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{OUT_DIR}/by_period"
+os.makedirs(BY_PERIOD_DIR, exist_ok=True)
+
+AGG_CSV = f"{Q1_3}/county_metric_comparison_2015_2025.csv"
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+
+
+def pctl(series):
+    return series.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+# ---- 3.3 recovery persistence ----
+def build_recovery(df, period_label):
+    d = df.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+    d["D_c"] = pd.to_numeric(d["p90_recovery_hr"], errors="coerce")
+    d["D_c_star"] = pctl(d["D_c"])
+    out = d[["county_fips", "county_name", "state", "D_c", "D_c_star"]].copy()
+    out.insert(0, "period", period_label)
+    out["n_counties_in_period"] = len(out)
+    return out.sort_values("D_c_star", ascending=False).reset_index(drop=True)
+
+
+# ---- 3.4 peak sensitivity variable ----
+def build_peak(df, period_label, mcc_map):
+    d = df.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+    d["P_c"] = pd.to_numeric(d["peak_customers_out_p90"], errors="coerce")
+    d["P_c_star"] = pctl(d["P_c"])
+
+    d["mcc_customers"] = pd.to_numeric(d["county_fips"].map(mcc_map), errors="coerce")
+    d.loc[d["mcc_customers"] <= 0, "mcc_customers"] = np.nan
+    d["mcc_flag"] = (d["mcc_customers"] < d["P_c"]).fillna(False)
+    frac = (d["P_c"] / d["mcc_customers"]).replace([np.inf, -np.inf], np.nan)
+    d["P_c_frac"] = frac.clip(upper=1.0)          # cap1-consistent fraction
+    d["P_c_frac_star"] = pctl(d["P_c_frac"])
+
+    out = d[["county_fips", "county_name", "state",
+             "P_c", "P_c_star", "mcc_customers", "mcc_flag",
+             "P_c_frac", "P_c_frac_star"]].copy()
+    out.insert(0, "period", period_label)
+    out["n_counties_in_period"] = len(out)
+    return out.sort_values("P_c_star", ascending=False).reset_index(drop=True)
+
+
+mcc_map = load_mcc(MCC_CSV)
+print(f"MCC counties: {len(mcc_map):,}")
+
+agg = pd.read_csv(AGG_CSV, dtype={"county_fips": str})
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+
+for col in ["p90_recovery_hr", "peak_customers_out_p90"]:
+    if col not in agg.columns:
+        raise ValueError(f"'{col}' missing from aggregate file")
+
+rec_parts, peak_parts = [], []
+years = sorted(int(p) for p in yearly["period"].unique() if str(p).isdigit())
+
+for yr in years:
+    g = yearly[yearly["period"] == str(yr)]
+    r = build_recovery(g, str(yr))
+    p = build_peak(g, str(yr), mcc_map)
+    r.to_csv(f"{BY_PERIOD_DIR}/recovery_component_{yr}.csv", index=False)
+    p.to_csv(f"{BY_PERIOD_DIR}/peak_sensitivity_{yr}.csv", index=False)
+    rec_parts.append(r); peak_parts.append(p)
+    print(f"  {yr}: D_c median={r['D_c'].median():.2f} hr, "
+          f"P_c median={p['P_c'].median():.0f}")
+
+r = build_recovery(agg, "2015_2025")
+p = build_peak(agg, "2015_2025", mcc_map)
+r.to_csv(f"{BY_PERIOD_DIR}/recovery_component_2015_2025.csv", index=False)
+p.to_csv(f"{BY_PERIOD_DIR}/peak_sensitivity_2015_2025.csv", index=False)
+rec_parts.append(r); peak_parts.append(p)
+print(f"  pooled: D_c median={r['D_c'].median():.2f} hr, "
+      f"P_c median={p['P_c'].median():.0f}")
+
+pd.concat(rec_parts, ignore_index=True).to_csv(
+    f"{OUT_DIR}/recovery_component_by_period.csv", index=False)
+pd.concat(peak_parts, ignore_index=True).to_csv(
+    f"{OUT_DIR}/peak_sensitivity_by_period.csv", index=False)
+
+print(f"\nWrote:\n  {OUT_DIR}/recovery_component_by_period.csv")
+print(f"  {OUT_DIR}/peak_sensitivity_by_period.csv")
+print(f"  {BY_PERIOD_DIR}/recovery_component_<period>.csv  (12 files)")
+print(f"  {BY_PERIOD_DIR}/peak_sensitivity_<period>.csv    (12 files)")
+
+print("\nTop 8 counties by pooled recovery persistence (D_c*):")
+print(r.head(8)[["county_fips", "county_name", "state", "D_c", "D_c_star"]]
+      .to_string(index=False))
