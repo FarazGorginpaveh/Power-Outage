@@ -1,0 +1,173 @@
+"""
+Final figure — Baseline vs LHS robustness, 4-panel  (BOTH configurations)
+=========================================================================
+One 4-panel figure per LHS configuration:
+
+    3dim_EBD   -> fig_baseline_vs_lhs_4panel_3dim_EBD.png   (MAIN result)
+    4dim_EBDP  -> fig_baseline_vs_lhs_4panel_4dim_EBDP.png  (peak sensitivity)
+
+Panel A: baseline risk class (equal weights, 3-dim) — IDENTICAL in both figures,
+         because the baseline never changes; only the LHS robustness differs.
+Panel B: LHS very-high-risk probability map (P_VH, 0-1)
+Panel C: LHS robustness class map (rare / weight-sensitive / moderately robust / robust)
+Panel D: scatter, baseline risk percentile (x) vs P_VH (y)
+         -> baseline-very-high but unstable (bottom-right)
+            baseline-moderate/high but robust (top-left/middle)
+
+If a config's county_risk_final_<tag>.csv is missing, that config is skipped
+with a message instead of crashing.
+
+Reads:  Results/Q3/county_risk_final_<tag>.csv
+        Results/Q3/lhs_weight_scenarios_<tag>.csv   (only to read K for titles)
+        shapefile cb_2022_us_county_5m.shp
+Writes: Results/Q3/figures/fig_baseline_vs_lhs_4panel_<tag>.png
+
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+FIG_DIR = f"{Q3}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 1000
+plt.rcParams.update({"figure.facecolor": "white", "font.size": 9})
+
+CONFIGS = [
+    {"tag": "3dim_EBD", "label": "main weight-robustness (E, B, D)", "main": True},
+    {"tag": "4dim_EBDP", "label": "peak-inclusion sensitivity (E, B, D, P)",
+     "main": False},
+]
+
+BASELINE_LABELS = ["low", "moderate", "high", "very high"]
+BASELINE_COLORS = {"low": "#fee5d9", "moderate": "#fcae91",
+                   "high": "#fb6a4a", "very high": "#a50f15"}
+ROBUST_LABELS = ["rare", "weight-sensitive", "moderately robust", "robust"]
+ROBUST_COLORS = {"rare": "#deebf7", "weight-sensitive": "#9ecae1",
+                 "moderately robust": "#4292c6", "robust": "#08306b"}
+
+# ---- load the shapefile once (shared across both figures) ----
+gdf = gpd.read_file(SHP_PATH)
+gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+gdf = gdf.to_crs("EPSG:5070")
+
+
+def make_figure(cfg):
+    tag, label = cfg["tag"], cfg["label"]
+    final_csv = f"{Q3}/county_risk_final_{tag}.csv"
+    if not os.path.exists(final_csv):
+        print(f"[{tag}] {final_csv} not found -- skipping this configuration.")
+        return
+
+    d = pd.read_csv(final_csv, dtype={"county_fips": str})
+    d["county_fips"] = d["county_fips"].str.zfill(5)
+    d["baseline_class"] = pd.Categorical(d["baseline_class"],
+                                         categories=BASELINE_LABELS)
+    d["lhs_robustness_class"] = pd.Categorical(d["lhs_robustness_class"],
+                                               categories=ROBUST_LABELS)
+    try:
+        K = len(pd.read_csv(f"{Q3}/lhs_weight_scenarios_{tag}.csv"))
+        kstr = f"{K:,}"
+    except FileNotFoundError:
+        kstr = "K"
+
+    geo = gdf.merge(d, on="county_fips", how="left")
+    print(f"[{tag}] counties matched: {geo['R_base'].notna().sum():,} / {len(geo):,}")
+
+    fig = plt.figure(figsize=(18, 15))
+    axA, axB = fig.add_subplot(2, 2, 1), fig.add_subplot(2, 2, 2)
+    axC, axD = fig.add_subplot(2, 2, 3), fig.add_subplot(2, 2, 4)
+
+    # Panel A — baseline class (same in both figures)
+    cmapA = ListedColormap([BASELINE_COLORS[c] for c in BASELINE_LABELS])
+    geo["baseline_code"] = geo["baseline_class"].cat.codes.replace(-1, np.nan)
+    geo.plot(column="baseline_code", cmap=cmapA, vmin=0, vmax=3, linewidth=0.04,
+             edgecolor="white", ax=axA, missing_kwds={"color": MISSING_COLOR})
+    axA.legend(handles=[mpatches.Patch(color=BASELINE_COLORS[c],
+               label=f"{c} (n={int((d['baseline_class'] == c).sum()):,})")
+               for c in BASELINE_LABELS],
+               loc="lower right", fontsize=7.5, framealpha=0.95)
+    axA.set_axis_off()
+    axA.set_title("A. Baseline risk class (equal weights, 3-dim)\n"
+                  "R_base percentile -> low / moderate / high / very high",
+                  fontsize=11)
+
+    # Panel B — P_VH continuous
+    geo.plot(column="P_VH", cmap="magma_r", vmin=0, vmax=1, linewidth=0.04,
+             edgecolor="white", legend=True, ax=axB,
+             missing_kwds={"color": MISSING_COLOR},
+             legend_kwds={"shrink": 0.7, "label": "P_VH (probability of top 10%)"})
+    axB.set_axis_off()
+    axB.set_title(f"B. LHS very-high-risk probability (P_VH)\n"
+                  f"Share of {kstr} weight scenarios where county is top 10% "
+                  f"[{label}]", fontsize=11)
+
+    # Panel C — robustness class
+    cmapC = ListedColormap([ROBUST_COLORS[c] for c in ROBUST_LABELS])
+    geo["robust_code"] = geo["lhs_robustness_class"].cat.codes.replace(-1, np.nan)
+    geo.plot(column="robust_code", cmap=cmapC, vmin=0, vmax=3, linewidth=0.04,
+             edgecolor="white", ax=axC, missing_kwds={"color": MISSING_COLOR})
+    axC.legend(handles=[mpatches.Patch(color=ROBUST_COLORS[c],
+               label=f"{c} (n={int((d['lhs_robustness_class'] == c).sum()):,})")
+               for c in ROBUST_LABELS],
+               loc="lower right", fontsize=7.5, framealpha=0.95)
+    axC.set_axis_off()
+    axC.set_title("C. LHS robustness class\n"
+                  "rare / weight-sensitive / moderately robust / robust", fontsize=11)
+
+    # Panel D — baseline percentile vs P_VH
+    for cls in BASELINE_LABELS:
+        sub = d[d["baseline_class"] == cls]
+        axD.scatter(sub["R_base_percentile"], sub["P_VH"], s=14, alpha=0.75,
+                    color=BASELINE_COLORS[cls], edgecolors="none", label=cls)
+    axD.axvline(90, color="gray", ls="--", lw=1, alpha=0.7)
+    axD.axhline(0.50, color="gray", ls="--", lw=1, alpha=0.7)
+    axD.axhline(0.10, color="gray", ls=":", lw=1, alpha=0.6)
+    axD.annotate("baseline-very-high but unstable\n(very high class, low P_VH)",
+                 xy=(95, 0.05), xytext=(58, 0.30), fontsize=8, color="#a50f15",
+                 arrowprops=dict(arrowstyle="->", color="#a50f15", lw=0.8))
+    axD.annotate("baseline-moderate/high\nbut robust (high P_VH)",
+                 xy=(70, 0.75), xytext=(18, 0.88), fontsize=8, color="#08306b",
+                 arrowprops=dict(arrowstyle="->", color="#08306b", lw=0.8))
+    axD.set_xlabel("Baseline risk percentile (R_base_percentile)")
+    axD.set_ylabel("P_VH (probability of top 10% under LHS)")
+    axD.set_xlim(-2, 102)
+    axD.set_ylim(-0.03, 1.03)
+    axD.set_title("D. Baseline percentile vs LHS very-high-risk probability\n"
+                  "Dashed: baseline 90th pct; P_VH = 0.50 and 0.10", fontsize=11)
+    axD.legend(title="Baseline class", loc="upper left", fontsize=8, framealpha=0.9)
+    axD.grid(alpha=0.25)
+
+    fig.suptitle(f"Baseline equal-weight risk vs LHS robustness — {label}",
+                 fontsize=15, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fname = f"{FIG_DIR}/fig_baseline_vs_lhs_4panel_{tag}.png"
+    fig.savefig(fname, dpi=DPI)
+    plt.close(fig)
+    print(f"[{tag}] saved {fname}")
+
+    unstable = d[(d["baseline_class"] == "very high") & (d["P_VH"] < 0.50)]
+    robust_emerging = d[(d["baseline_class"].isin(["moderate", "high"]))
+                        & (d["P_VH"] >= 0.50)]
+    print(f"[{tag}] baseline 'very high' but P_VH<0.50 (unstable): {len(unstable):,}")
+    print(f"[{tag}] baseline 'moderate'/'high' but P_VH>=0.50 (robust): "
+          f"{len(robust_emerging):,}")
+
+
+for cfg in CONFIGS:
+    make_figure(cfg)
