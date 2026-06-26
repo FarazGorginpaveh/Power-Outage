@@ -1,0 +1,199 @@
+"""
+Section 6 — LHS weight-sensitivity experiment  (BOTH configurations)
+=====================================================================
+Runs the Latin-Hypercube weight-sensitivity test TWICE:
+
+  (A) 3-dim  : dims = E, B, D
+               This matches the baseline formula R_base = (E*+B*+D*)/3 and the
+               written spec  R_c^(k) = wE*E* + wB*B* + wD*D*.
+               -> This is the MAIN weight-robustness test.
+
+  (B) 4-dim  : dims = E, B, D, P
+               Peak (P) is given a real weight and competes on the simplex.
+               Peak is "sensitivity only" everywhere else, so this run is the
+               PEAK-INCLUSION SENSITIVITY test, not the main result.
+
+For each configuration, for K LHS-sampled weight vectors on the simplex:
+    score_k,c = sum_d  w_d,k * dim_d,c
+    rank counties within each scenario; very high = top 10%, high+ = top 25%
+    P_VH    = frac of scenarios county is very high
+    P_Hplus = frac of scenarios county is high or very high
+Then Option A (on P_VH) and Option B (on P_Hplus) robustness classes.
+
+Outputs are tagged by configuration:
+    lhs_weight_scenarios_<tag>.csv
+    county_lhs_summary_<tag>.csv
+    lhs_class_counts_optionA_<tag>.csv
+    lhs_class_counts_optionB_<tag>.csv
+  where <tag> is "3dim_EBD" or "4dim_EBDP".
+
+Reads:  Results/Q3/county_risk_input.csv
+Requires: pandas, numpy, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats.qmc import LatinHypercube
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+os.makedirs(Q3, exist_ok=True)
+
+INPUT_CSV = f"{Q3}/county_risk_input.csv"
+
+K = 1000                       # set to 10000 if you report 10,000 scenarios
+VERY_HIGH_TOP_FRAC = 0.10      # top 10%
+HIGH_PLUS_TOP_FRAC = 0.25      # top 25%
+SEED = 42
+
+# The two configurations to run.
+CONFIGS = [
+    {
+        "tag": "3dim_EBD",
+        "dims": ["E_pct", "B_pct", "D_pct"],
+        "weight_names": ["w_E", "w_B", "w_D"],
+        "title": "3-DIM (E, B, D) — main weight-robustness test",
+    },
+    {
+        "tag": "4dim_EBDP",
+        "dims": ["E_pct", "B_pct", "D_pct", "P_pct"],
+        "weight_names": ["w_E", "w_B", "w_D", "w_P"],
+        "title": "4-DIM (E, B, D, P) — peak-inclusion sensitivity",
+    },
+]
+
+A_LABELS = ["rarely very high risk", "weight-sensitive very-high-risk candidate",
+            "moderately robust very-high-risk county", "robust very-high-risk county"]
+B_LABELS = ["rarely high risk", "weakly high-risk",
+            "moderately robust high-risk", "robust high-risk"]
+
+
+def sample_simplex_lhs(n_dims, k, seed):
+    """K LHS points mapped to a (near-)uniform distribution on the simplex
+    via exponential normalization. Rows sum to 1."""
+    u = LatinHypercube(d=n_dims, seed=seed).random(n=k)   # (k, n_dims) in (0,1)
+    e = -np.log(1.0 - u)                                   # Exponential(1) marginals
+    return e / e.sum(axis=1, keepdims=True)               # rows sum to 1
+
+
+def run_experiment(df, dims, weight_names, tag, title):
+    print("\n" + "=" * 64)
+    print(f"  {title}")
+    print("=" * 64)
+
+    n_dims = len(dims)
+    n_counties = len(df)
+    X = df[dims].to_numpy()                 # (n_counties, n_dims)
+    fips = df["county_fips"].to_numpy()
+
+    # ---- weights ----
+    weights = sample_simplex_lhs(n_dims, K, SEED)         # (K, n_dims)
+    scen = pd.DataFrame(weights, columns=weight_names)
+    scen.insert(0, "scenario_id", np.arange(1, K + 1))
+    scen.to_csv(f"{Q3}/lhs_weight_scenarios_{tag}.csv", index=False)
+    print(f"Weight marginals (each averages ~{1/n_dims:.3f}; "
+          f"NOT full 0-1 after normalizing):")
+    print(scen[weight_names].describe().round(3).to_string())
+
+    # ---- score & rank ----
+    scores = weights @ X.T                  # (K, n_counties)
+    order = np.argsort(-scores, axis=1)
+    ranks = np.empty_like(order)
+    row_idx = np.arange(K)[:, None]
+    ranks[row_idx, order] = np.arange(1, n_counties + 1)[None, :]
+
+    k_vh = max(1, int(np.ceil(VERY_HIGH_TOP_FRAC * n_counties)))
+    k_hp = max(1, int(np.ceil(HIGH_PLUS_TOP_FRAC * n_counties)))
+    P_VH = (ranks <= k_vh).mean(axis=0)
+    P_Hplus = (ranks <= k_hp).mean(axis=0)
+
+    rank_pct = (1.0 - (ranks - 1) / (n_counties - 1)) * 100.0
+    summary = pd.DataFrame({
+        "county_fips": fips,
+        "P_VH": P_VH,
+        "P_Hplus": P_Hplus,
+        "mean_rank_percentile": rank_pct.mean(axis=0),
+        "min_rank_percentile": rank_pct.min(axis=0),
+        "max_rank_percentile": rank_pct.max(axis=0),
+    }).merge(
+        df[["county_fips", "county_name", "state",
+            "E_pct", "B_pct", "D_pct", "P_pct"]],
+        on="county_fips", how="left")
+
+    # ---- robustness classes ----
+    summary["lhs_class_A"] = pd.cut(
+        summary["P_VH"],
+        bins=[-1, 0.0999999999, 0.4999999999, 0.8999999999, 2], labels=A_LABELS)
+    summary["lhs_class_B"] = pd.cut(
+        summary["P_Hplus"],
+        bins=[-1, 0.2499999999, 0.4999999999, 0.8999999999, 2], labels=B_LABELS)
+
+    summary = summary.sort_values("P_VH", ascending=False).reset_index(drop=True)
+    summary.to_csv(f"{Q3}/county_lhs_summary_{tag}.csv", index=False)
+
+    # ---- class-count tables ----
+    def counts(col, labels, fname, idx_name):
+        c = summary[col].value_counts().reindex(labels, fill_value=0)
+        t = c.rename("n_counties").to_frame()
+        t["pct_of_counties"] = (t["n_counties"] / n_counties * 100).round(1)
+        t.index.name = idx_name
+        t.reset_index().to_csv(f"{Q3}/{fname}", index=False)
+        return t
+
+    cA = counts("lhs_class_A", A_LABELS,
+                f"lhs_class_counts_optionA_{tag}.csv", "lhs_class_A (P_VH)")
+    cB = counts("lhs_class_B", B_LABELS,
+                f"lhs_class_counts_optionB_{tag}.csv", "lhs_class_B (P_Hplus)")
+
+    print(f"\nvery-high cutoff: top {k_vh} / high+ cutoff: top {k_hp} "
+          f"of {n_counties:,} counties")
+    print(f"Counties P_VH >= 0.90 (robust very-high): "
+          f"{(summary['P_VH'] >= 0.90).sum():,}")
+    print(f"Counties P_VH == 0 (never very-high):     "
+          f"{(summary['P_VH'] == 0).sum():,}")
+    print("\nOption A counts:\n" + cA.to_string())
+    print("\nOption B counts:\n" + cB.to_string())
+    print("\nTop 10 by P_VH:")
+    print(summary.head(10)[["county_fips", "county_name", "state",
+          "E_pct", "B_pct", "D_pct", "P_pct", "P_VH", "P_Hplus"]]
+          .round(3).to_string(index=False))
+    return summary
+
+
+# ============================================================
+# load once, run both configurations
+# ============================================================
+df = pd.read_csv(INPUT_CSV, dtype={"county_fips": str})
+df["county_fips"] = df["county_fips"].str.zfill(5)
+for c in ["E_pct", "B_pct", "D_pct", "P_pct"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+print(f"Counties: {len(df):,}   |   K = {K} scenarios per configuration")
+
+results = {}
+for cfg in CONFIGS:
+    results[cfg["tag"]] = run_experiment(
+        df, cfg["dims"], cfg["weight_names"], cfg["tag"], cfg["title"])
+
+# ============================================================
+# quick comparison: does adding P change who is robustly very-high?
+# ============================================================
+a = results["3dim_EBD"][["county_fips", "P_VH"]].rename(columns={"P_VH": "P_VH_3dim"})
+b = results["4dim_EBDP"][["county_fips", "P_VH"]].rename(columns={"P_VH": "P_VH_4dim"})
+cmp = a.merge(b, on="county_fips")
+cmp["delta"] = cmp["P_VH_4dim"] - cmp["P_VH_3dim"]
+robust_3 = set(cmp.loc[cmp["P_VH_3dim"] >= 0.90, "county_fips"])
+robust_4 = set(cmp.loc[cmp["P_VH_4dim"] >= 0.90, "county_fips"])
+
+print("\n" + "=" * 64)
+print("  COMPARISON: 3-dim vs 4-dim")
+print("=" * 64)
+print(f"Robust very-high (P_VH>=0.90)  3-dim: {len(robust_3):,}   "
+      f"4-dim: {len(robust_4):,}")
+print(f"In both:        {len(robust_3 & robust_4):,}")
+print(f"Only 3-dim:     {len(robust_3 - robust_4):,}  (drop out when P competes)")
+print(f"Only 4-dim:     {len(robust_4 - robust_3):,}  (appear only via peak)")
+print(f"Mean |delta P_VH| across counties: {cmp['delta'].abs().mean():.3f}")
+cmp.sort_values("delta", key=lambda s: s.abs(), ascending=False).to_csv(
+    f"{Q3}/lhs_compare_3dim_vs_4dim.csv", index=False)
+print(f"\nWrote {Q3}/lhs_compare_3dim_vs_4dim.csv")
