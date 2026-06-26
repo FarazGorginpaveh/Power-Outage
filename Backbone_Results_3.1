@@ -1,0 +1,105 @@
+"""
+Section 3.1 — Storm exposure component of the disruption risk score
+===================================================================
+First of three dimensions in the county-level relative observed storm-induced
+power disruption risk index.
+
+  E_c   = number of storm-exposure events linked to county c in the period
+        ( = storm_exposure_count )
+  E_c*  = Pctl(E_c) in [0, 100]   (percentile rank of exposure across counties)
+
+Computed for each year 2015-2025 AND for the pooled 2015-2025 period.
+County universe = cap1 (all counties kept; cap1 only affects the later burden
+dimension, not exposure, but the county set is held consistent here).
+
+Percentile uses average-rank (the pipeline-wide convention), so E_c* matches
+the existing exposure_percentile column and ties share a rank.
+
+Reads (canonical, from Q1_3):
+    county_metric_comparison_2015_2025.csv          (pooled)
+    county_metric_comparison_yearly_2015_2025.csv   (per year)
+Writes to Results/Q3:
+    exposure_component_by_period.csv      long format: all years + pooled
+    by_period/exposure_component_{period}.csv
+
+Requires: pandas, numpy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{OUT_DIR}/by_period"
+os.makedirs(BY_PERIOD_DIR, exist_ok=True)
+
+AGG_CSV = f"{Q1_3}/county_metric_comparison_2015_2025.csv"
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+
+
+def exposure_percentile(series):
+    """Average-rank percentile in [0, 100]; ties share a rank."""
+    return series.rank(pct=True, method="average") * 100.0
+
+
+def build_exposure(df, period_label):
+    d = df.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+    d["E_c"] = pd.to_numeric(d["storm_exposure_count"], errors="coerce").fillna(0)
+    d["E_c_star"] = exposure_percentile(d["E_c"])
+    out = d[["county_fips", "county_name", "state", "E_c", "E_c_star"]].copy()
+    out.insert(0, "period", period_label)
+    out["n_counties_in_period"] = len(out)
+    out = out.sort_values("E_c_star", ascending=False).reset_index(drop=True)
+    return out
+
+
+# ---- load ----
+agg = pd.read_csv(AGG_CSV, dtype={"county_fips": str})
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+
+for col, src in [("storm_exposure_count", "aggregate")]:
+    if col not in agg.columns:
+        raise ValueError(f"'{col}' missing from {src} file")
+
+parts = []
+
+# per year
+years = sorted(int(p) for p in yearly["period"].unique() if str(p).isdigit())
+for yr in years:
+    g = yearly[yearly["period"] == str(yr)]
+    out = build_exposure(g, str(yr))
+    out.to_csv(f"{BY_PERIOD_DIR}/exposure_component_{yr}.csv", index=False)
+    parts.append(out)
+    print(f"  {yr}: {len(out):,} counties, "
+          f"E_c range {out['E_c'].min():.0f}-{out['E_c'].max():.0f}")
+
+# pooled
+out_pooled = build_exposure(agg, "2015_2025")
+out_pooled.to_csv(f"{BY_PERIOD_DIR}/exposure_component_2015_2025.csv", index=False)
+parts.append(out_pooled)
+print(f"  pooled: {len(out_pooled):,} counties, "
+      f"E_c range {out_pooled['E_c'].min():.0f}-{out_pooled['E_c'].max():.0f}")
+
+combined = pd.concat(parts, ignore_index=True)
+combined.to_csv(f"{OUT_DIR}/exposure_component_by_period.csv", index=False)
+
+# ---- validation against existing exposure_percentile, if present ----
+if "exposure_percentile" in agg.columns:
+    chk = build_exposure(agg, "2015_2025").merge(
+        agg.assign(county_fips=agg["county_fips"].astype(str).str.zfill(5))
+           [["county_fips", "exposure_percentile"]],
+        on="county_fips", how="left")
+    diff = (chk["E_c_star"] - chk["exposure_percentile"]).abs().max()
+    print(f"\nMax |E_c* - existing exposure_percentile| (pooled): {diff:.3f} "
+          f"(should be ~0)")
+
+print(f"\nWrote:\n  {OUT_DIR}/exposure_component_by_period.csv "
+      f"({len(combined):,} rows)")
+print(f"  {BY_PERIOD_DIR}/exposure_component_<period>.csv  (12 files)")
+
+print("\nTop 10 counties by pooled exposure (E_c*):")
+print(out_pooled.head(10)[["county_fips", "county_name", "state",
+                           "E_c", "E_c_star"]].to_string(index=False))
