@@ -1,0 +1,229 @@
+"""
+Sections 5-7 — Baseline + LHS combined classification  (BOTH configurations)
+============================================================================
+Builds the final per-county classification TWICE, once per LHS configuration
+produced by the modified Section 6 script:
+
+  (A) tag = "3dim_EBD"  : LHS reweights E, B, D only.
+        baseline_class (3-dim) and the LHS robustness are over the SAME three
+        dimensions, so this answers the spec's real question:
+        "is the equal-weight class stable under other weights?"
+        -> THIS IS THE MAIN RESULT.
+
+  (B) tag = "4dim_EBDP" : LHS reweights E, B, D, P.
+        baseline_class is still 3-dim, but robustness now also lets peak enter.
+        -> PEAK-INCLUSION SENSITIVITY. baseline and LHS differ in dimensions,
+           so read it as "does the 3-dim class survive if peak is allowed in?",
+           not as a pure weight-robustness check.
+
+baseline_class always comes from R_base = (E*+B*+D*)/3 (3-dim), unchanged.
+
+For each config, for every county:
+    R_lhs_mean/median/p05/p95  distribution of the weighted score across scenarios
+    risk_uncertainty_width     = p95 - p05
+    prob_low/mod/high/very_high fraction of scenarios in each within-scenario class
+    P_VH, P_Hplus              carried from that config's LHS summary
+    lhs_robustness_class       Option A thresholds on P_VH
+    final_class                Section 6 cascade (baseline_class + P_VH)
+
+Outputs (tagged):
+    county_risk_final_<tag>.csv
+    final_class_counts_<tag>.csv
+    figures/fig_map_final_class_<tag>.png
+
+Reads:  county_risk_input.csv, county_risk_baseline.csv,
+        lhs_weight_scenarios_<tag>.csv, county_lhs_summary_<tag>.csv
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+FIG_DIR = f"{Q3}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 300
+
+# the two LHS configurations written by the modified Section 6
+CONFIGS = [
+    {"tag": "3dim_EBD", "dims": ["E_pct", "B_pct", "D_pct"],
+     "wcols": ["w_E", "w_B", "w_D"], "main": True},
+    {"tag": "4dim_EBDP", "dims": ["E_pct", "B_pct", "D_pct", "P_pct"],
+     "wcols": ["w_E", "w_B", "w_D", "w_P"], "main": False},
+]
+
+ROBUST_LABELS = ["rare", "weight-sensitive", "moderately robust", "robust"]
+FINAL_ORDER = ["Robust very-high-risk hotspot", "Moderately robust hotspot",
+               "Weight-sensitive hotspot", "Emerging hotspot",
+               "Not robust hotspot", "Unclassified (see baseline_class/P_VH)"]
+CLASS_COLORS = {
+    "Robust very-high-risk hotspot": "#67000d",
+    "Moderately robust hotspot": "#cb181d",
+    "Weight-sensitive hotspot": "#fb6a4a",
+    "Emerging hotspot": "#fdae6b",
+    "Not robust hotspot": "#f0f0f0",
+    "Unclassified (see baseline_class/P_VH)": "#9ecae1",
+}
+
+
+def final_class(bc, pvh):
+    if bc == "very high" and pvh >= 0.90:
+        return "Robust very-high-risk hotspot"
+    if bc == "very high" and 0.50 <= pvh < 0.90:
+        return "Moderately robust hotspot"
+    if bc == "very high" and 0.10 <= pvh < 0.50:
+        return "Weight-sensitive hotspot"
+    if bc == "high" and pvh >= 0.50:
+        return "Emerging hotspot"
+    if pvh < 0.10:
+        return "Not robust hotspot"
+    return "Unclassified (see baseline_class/P_VH)"
+
+
+# ---- load the shared, config-independent inputs once ----
+inp = pd.read_csv(f"{Q3}/county_risk_input.csv", dtype={"county_fips": str})
+base = pd.read_csv(f"{Q3}/county_risk_baseline.csv", dtype={"county_fips": str})
+for d in (inp, base):
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+inp = inp.sort_values("county_fips").reset_index(drop=True)
+fips = inp["county_fips"].to_numpy()
+n_counties = len(inp)
+base_cols = base[["county_fips", "county_name", "state",
+                  "R_base", "R_base_percentile", "risk_class"]].rename(
+    columns={"risk_class": "baseline_class"})
+print(f"Counties: {n_counties:,}")
+
+
+def run_config(cfg):
+    tag, dims, wcols = cfg["tag"], cfg["dims"], cfg["wcols"]
+    print("\n" + "=" * 64)
+    print(f"  FINAL CLASSIFICATION — {tag}"
+          f"{'  (MAIN)' if cfg['main'] else '  (peak sensitivity)'}")
+    print("=" * 64)
+
+    scen = pd.read_csv(f"{Q3}/lhs_weight_scenarios_{tag}.csv")
+    lhs = pd.read_csv(f"{Q3}/county_lhs_summary_{tag}.csv", dtype={"county_fips": str})
+    lhs["county_fips"] = lhs["county_fips"].astype(str).str.zfill(5)
+    K = len(scen)
+
+    X = inp[dims].apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy()
+    W = scen[wcols].to_numpy()
+    scores = W @ X.T                                    # (K, n_counties), 0-100 scale
+
+    order = np.argsort(-scores, axis=1)
+    ranks = np.empty_like(order)
+    row_idx = np.arange(K)[:, None]
+    ranks[row_idx, order] = np.arange(1, n_counties + 1)[None, :]
+    rank_pct = (1.0 - (ranks - 1) / (n_counties - 1)) * 100.0
+
+    # within-scenario class, same cutoffs as baseline (50/75/90)
+    cls_code = np.digitize(rank_pct, bins=[50, 75, 90], right=True)
+    dist = pd.DataFrame({
+        "county_fips": fips,
+        "R_lhs_mean": scores.mean(axis=0),
+        "R_lhs_median": np.median(scores, axis=0),
+        "R_lhs_p05": np.percentile(scores, 5, axis=0),
+        "R_lhs_p95": np.percentile(scores, 95, axis=0),
+        "risk_uncertainty_width": np.percentile(scores, 95, axis=0)
+                                  - np.percentile(scores, 5, axis=0),
+        "prob_low": (cls_code == 0).mean(axis=0),
+        "prob_moderate": (cls_code == 1).mean(axis=0),
+        "prob_high": (cls_code == 2).mean(axis=0),
+        "prob_very_high": (cls_code == 3).mean(axis=0),
+    })
+
+    # sanity: prob_very_high must equal P_VH from the LHS summary
+    chk = dist.merge(lhs[["county_fips", "P_VH"]], on="county_fips")
+    print(f"Max |prob_very_high - P_VH| (should be ~0): "
+          f"{(chk['prob_very_high'] - chk['P_VH']).abs().max():.6f}")
+
+    out = (base_cols
+           .merge(dist, on="county_fips", how="left")
+           .merge(lhs[["county_fips", "P_VH", "P_Hplus"]],
+                  on="county_fips", how="left"))
+    out["lhs_robustness_class"] = pd.cut(
+        out["P_VH"], bins=[-1, 0.0999999999, 0.4999999999, 0.8999999999, 2],
+        labels=ROBUST_LABELS)
+    out["final_class"] = [final_class(bc, pvh)
+                          for bc, pvh in zip(out["baseline_class"], out["P_VH"])]
+
+    out = out[["county_fips", "county_name", "state",
+               "R_base", "R_base_percentile", "baseline_class",
+               "R_lhs_mean", "R_lhs_median", "R_lhs_p05", "R_lhs_p95",
+               "risk_uncertainty_width",
+               "prob_low", "prob_moderate", "prob_high", "prob_very_high",
+               "P_VH", "P_Hplus", "lhs_robustness_class", "final_class"]]
+    out.to_csv(f"{Q3}/county_risk_final_{tag}.csv", index=False)
+
+    counts = out["final_class"].value_counts().reindex(FINAL_ORDER, fill_value=0)
+    cdf = counts.rename("n_counties").to_frame()
+    cdf["pct_of_counties"] = (cdf["n_counties"] / len(out) * 100).round(1)
+    cdf.index.name = "final_class"
+    cdf.reset_index().to_csv(f"{Q3}/final_class_counts_{tag}.csv", index=False)
+    print("\nFinal class counts:")
+    print(cdf.reset_index().to_string(index=False))
+
+    # map
+    gdf = gpd.read_file(SHP_PATH)
+    gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+    gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+    gdf = gdf.to_crs("EPSG:5070")
+    geo = gdf.merge(out, on="county_fips", how="left")
+    present = [c for c in FINAL_ORDER if (out["final_class"] == c).any()]
+    cmap = ListedColormap([CLASS_COLORS[c] for c in present])
+    geo["cls_code"] = pd.Categorical(geo["final_class"], categories=present).codes
+    geo.loc[geo["cls_code"] < 0, "cls_code"] = np.nan
+
+    fig, ax = plt.subplots(figsize=(13, 8))
+    geo.plot(column="cls_code", cmap=cmap, vmin=0, vmax=max(1, len(present) - 1),
+             linewidth=0.05, edgecolor="white", ax=ax,
+             missing_kwds={"color": MISSING_COLOR})
+    handles = [mpatches.Patch(color=CLASS_COLORS[c],
+               label=f"{c} (n={int((out['final_class'] == c).sum()):,})")
+               for c in present]
+    handles.append(mpatches.Patch(facecolor=MISSING_COLOR, hatch="///",
+                                  label="No data"))
+    ax.legend(handles=handles, loc="lower right", fontsize=7.5, framealpha=0.95)
+    ax.set_axis_off()
+    sub = "main weight-robustness (E,B,D)" if cfg["main"] \
+        else "peak-inclusion sensitivity (E,B,D,P)"
+    ax.set_title(f"Final disruption risk classification — {sub}\n"
+                 "baseline equal-weight class combined with LHS robustness",
+                 fontsize=12, pad=10)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/fig_map_final_class_{tag}.png", dpi=DPI)
+    plt.close(fig)
+    print(f"Wrote county_risk_final_{tag}.csv, final_class_counts_{tag}.csv, "
+          f"fig_map_final_class_{tag}.png")
+    return out
+
+
+results = {cfg["tag"]: run_config(cfg) for cfg in CONFIGS}
+
+# ---- compare the two final classifications ----
+m = results["3dim_EBD"][["county_fips", "final_class"]].rename(
+        columns={"final_class": "final_3dim"}).merge(
+    results["4dim_EBDP"][["county_fips", "final_class"]].rename(
+        columns={"final_class": "final_4dim"}), on="county_fips")
+n_changed = (m["final_3dim"] != m["final_4dim"]).sum()
+print("\n" + "=" * 64)
+print("  COMPARISON: 3-dim vs 4-dim final_class")
+print("=" * 64)
+print(f"Counties whose final_class changes when peak is added: "
+      f"{n_changed:,} ({n_changed / len(m) * 100:.1f}%)")
+m[m["final_3dim"] != m["final_4dim"]].to_csv(
+    f"{Q3}/final_class_changes_3dim_vs_4dim.csv", index=False)
+print(f"Wrote {Q3}/final_class_changes_3dim_vs_4dim.csv")
