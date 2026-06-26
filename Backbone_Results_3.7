@@ -1,0 +1,173 @@
+"""
+Section 5 — Supporting diagnostic scores
+=========================================
+Not substitutes for the risk score; they aid interpretation.
+
+5.1 Disproportionate disruption score
+    DR_c = B_pct - E_pct
+    positive -> burden rank exceeds exposure rank (worse than hazard alone predicts)
+    ~ 0     -> burden rank aligns with exposure rank
+    negative -> exposure rank exceeds burden rank (better than hazard alone predicts)
+
+5.2 Recovery-burden score
+    RB_c = (B_pct + D_pct) / 2
+    identifies counties with both high normalized burden AND slow recovery
+
+Deliverables:
+  1. county_disproportionate_disruption.csv   (DR_c, RB_c, + inputs)
+  2. fig_map_DRc.png            map of DR_c (diverging)
+  3. fig_map_RBc.png            map of RB_c (sequential)
+  4. fig_scatter_E_vs_B_by_DR.png   E_pct vs B_pct scatter, colored by DR_c
+
+Done for pooled 2015-2025 (primary) and each year (by_period/, CSV only).
+
+Reads:  Results/Q3/county_risk_input.csv               (pooled)
+        Results/Q3/by_period/county_risk_input_{yr}.csv (per year)
+        shapefile cb_2022_us_county_5m.shp
+Writes: Results/Q3/  Results/Q3/by_period/  Results/Q3/figures/
+
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{Q3}/by_period"
+FIG_DIR = f"{Q3}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 300
+plt.rcParams.update({"figure.facecolor": "white", "font.size": 10})
+
+
+def add_diagnostics(df):
+    d = df.copy()
+    d["DR_c"] = d["B_pct"] - d["E_pct"]          # disproportionate disruption
+    d["RB_c"] = (d["B_pct"] + d["D_pct"]) / 2.0  # recovery-burden score
+    return d
+
+
+# ============================================================
+# pooled (primary) + per-year
+# ============================================================
+
+def process(path, period_label, make_figs):
+    df = pd.read_csv(path, dtype={"county_fips": str})
+    df["county_fips"] = df["county_fips"].str.zfill(5)
+    d = add_diagnostics(df)
+
+    if period_label == "2015_2025":
+        d.to_csv(f"{Q3}/county_disproportionate_disruption.csv", index=False)
+    else:
+        d.to_csv(f"{BY_PERIOD_DIR}/county_disproportionate_disruption_"
+                 f"{period_label}.csv", index=False)
+
+    if not make_figs:
+        return d
+
+    gdf = gpd.read_file(SHP_PATH)
+    gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+    gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+    gdf = gdf.to_crs("EPSG:5070")
+    geo = gdf.merge(d, on="county_fips", how="left")
+
+    # ---- 2. map of DR_c (diverging) ----
+    fig, ax = plt.subplots(figsize=(13, 8))
+    norm = TwoSlopeNorm(vmin=-80, vcenter=0, vmax=80)
+    geo.plot(column="DR_c", cmap="RdBu_r", norm=norm, linewidth=0.05,
+             edgecolor="white", legend=True, ax=ax,
+             missing_kwds={"color": MISSING_COLOR, "label": "No data"},
+             legend_kwds={"shrink": 0.6,
+                          "label": "DR_c = burden pct - exposure pct"})
+    ax.set_axis_off()
+    ax.set_title("Disproportionate disruption score (DR_c), 2015-2025\n"
+                 "Red = burden exceeds what exposure alone would predict; "
+                 "blue = exposure exceeds burden", fontsize=12, pad=10)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/fig_map_DRc.png", dpi=DPI)
+    plt.close(fig)
+
+    # ---- 3. map of RB_c (sequential) ----
+    fig, ax = plt.subplots(figsize=(13, 8))
+    geo.plot(column="RB_c", cmap="YlOrRd", linewidth=0.05, edgecolor="white",
+             legend=True, ax=ax,
+             missing_kwds={"color": MISSING_COLOR, "label": "No data"},
+             legend_kwds={"shrink": 0.6,
+                          "label": "RB_c = mean(burden pct, recovery pct)"})
+    ax.set_axis_off()
+    ax.set_title("Recovery-burden score (RB_c), 2015-2025\n"
+                 "High values = both high normalized burden AND slow recovery",
+                 fontsize=12, pad=10)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/fig_map_RBc.png", dpi=DPI)
+    plt.close(fig)
+
+    # ---- 4. scatter E_pct vs B_pct, colored by DR_c ----
+    fig, ax = plt.subplots(figsize=(8.5, 8))
+    norm2 = TwoSlopeNorm(vmin=-80, vcenter=0, vmax=80)
+    sc = ax.scatter(d["E_pct"], d["B_pct"], c=d["DR_c"], cmap="RdBu_r",
+                    norm=norm2, s=14, alpha=0.75, edgecolors="none")
+    ax.plot([0, 100], [0, 100], ls="--", lw=1, color="black", alpha=0.6,
+            label="DR_c = 0 (burden aligns with exposure)")
+    cb = fig.colorbar(sc, ax=ax, shrink=0.85)
+    cb.set_label("DR_c = B_pct - E_pct")
+    top = d.reindex(d["DR_c"].abs().sort_values(ascending=False).index).head(6)
+    for _, r in top.iterrows():
+        ax.annotate(f"{r['county_name']}, {r['state']}",
+                    (r["E_pct"], r["B_pct"]), fontsize=7, alpha=0.9,
+                    xytext=(4, 4), textcoords="offset points")
+    ax.set_xlabel("Storm exposure percentile (E_pct)")
+    ax.set_ylabel("Normalized burden percentile (B_pct)")
+    ax.set_title("Storm exposure vs normalized burden, colored by "
+                 "disproportionate disruption (DR_c)")
+    ax.set_xlim(-2, 102)
+    ax.set_ylim(-2, 102)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/fig_scatter_E_vs_B_by_DR.png", dpi=DPI)
+    plt.close(fig)
+
+    return d
+
+
+print("Building diagnostic scores ...")
+pooled = process(f"{Q3}/county_risk_input.csv", "2015_2025", make_figs=True)
+
+for f in sorted(glob.glob(f"{BY_PERIOD_DIR}/county_risk_input_*.csv")):
+    yr = f.split("_")[-1].replace(".csv", "")
+    if yr.isdigit():
+        process(f, yr, make_figs=False)
+
+# ---- console summaries ----
+print("\nDR_c summary (pooled):")
+print(pooled["DR_c"].describe().round(2).to_string())
+print(f"\nCounties with DR_c > 25 (burden well above exposure): "
+      f"{(pooled['DR_c'] > 25).sum():,} ({(pooled['DR_c'] > 25).mean()*100:.1f}%)")
+print(f"Counties with DR_c < -25 (exposure well above burden): "
+      f"{(pooled['DR_c'] < -25).sum():,} ({(pooled['DR_c'] < -25).mean()*100:.1f}%)")
+
+print("\nTop 10 by DR_c (most disproportionately burdened given their exposure):")
+print(pooled.nlargest(10, "DR_c")[["county_fips", "county_name", "state",
+     "E_pct", "B_pct", "DR_c"]].round(1).to_string(index=False))
+
+print("\nTop 10 by RB_c (high burden AND slow recovery):")
+print(pooled.nlargest(10, "RB_c")[["county_fips", "county_name", "state",
+     "B_pct", "D_pct", "RB_c"]].round(1).to_string(index=False))
+
+print(f"\nDeliverables written to {Q3}:")
+print("  county_disproportionate_disruption.csv")
+print(f"  figures/fig_map_DRc.png, fig_map_RBc.png, fig_scatter_E_vs_B_by_DR.png")
+print(f"  by_period/county_disproportionate_disruption_<year>.csv")
