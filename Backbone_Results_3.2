@@ -1,0 +1,119 @@
+"""
+Section 3.2 — Normalized customer-hour burden component
+=======================================================
+Second of three dimensions in the disruption risk score.
+
+  customer-hours_c = sum(customers_out * 0.25)        [15-min interval -> hours]
+                   ( = total_customer_hours, already computed in the pipeline )
+  B_c   = customer-hours_c / total customers served_c
+        ( total customers served = MCC Customers; cap1: flagged counties = 1 )
+  B_c*  = Pctl(B_c) in [0, 100]
+
+cap1 rule: a county where MCC < peak_customers_out_p90 (more customers reported
+out than the served base) has B_c set to 1 (fully saturated). Counties with no
+MCC denominator get B_c = NaN and are ranked at the bottom (B_c_for_rank = 0),
+matching the pipeline convention.
+
+Computed for each year 2015-2025 and for the pooled 2015-2025 period.
+
+Reads (canonical, from Q1_3) + MCC.csv:
+    county_metric_comparison_2015_2025.csv
+    county_metric_comparison_yearly_2015_2025.csv
+    MCC.csv  (County_FIPS, Customers)
+Writes to Results/Q3:
+    burden_component_by_period.csv
+    by_period/burden_component_{period}.csv
+
+Requires: pandas, numpy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{OUT_DIR}/by_period"
+os.makedirs(BY_PERIOD_DIR, exist_ok=True)
+
+AGG_CSV = f"{Q1_3}/county_metric_comparison_2015_2025.csv"
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")        # drops 'Grand Total' etc.
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def build_burden(df, period_label, mcc_map):
+    d = df.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+    d["customer_hours"] = pd.to_numeric(d["total_customer_hours"], errors="coerce")
+    d["mcc_customers"] = pd.to_numeric(d["county_fips"].map(mcc_map), errors="coerce")
+    d.loc[d["mcc_customers"] <= 0, "mcc_customers"] = np.nan
+
+    peak = pd.to_numeric(d["peak_customers_out_p90"], errors="coerce")
+    d["mcc_flag"] = (d["mcc_customers"] < peak).fillna(False)
+
+    d["B_c"] = (d["customer_hours"] / d["mcc_customers"]).replace(
+        [np.inf, -np.inf], np.nan)
+    maxB = d["B_c"].max()                       # the highest normal burden
+    d.loc[d["mcc_flag"], "B_c"] = maxB          # saturated = worst
+
+    d["B_c_for_rank"] = d["B_c"].fillna(0)
+    d["B_c_star"] = d["B_c_for_rank"].rank(pct=True, method="average") * 100.0
+
+    out = d[["county_fips", "county_name", "state", "customer_hours",
+             "mcc_customers", "mcc_flag", "B_c", "B_c_star"]].copy()
+    out.insert(0, "period", period_label)
+    out["n_counties_in_period"] = len(out)
+    out = out.sort_values("B_c_star", ascending=False).reset_index(drop=True)
+    return out
+
+
+mcc_map = load_mcc(MCC_CSV)
+print(f"MCC counties: {len(mcc_map):,}")
+
+agg = pd.read_csv(AGG_CSV, dtype={"county_fips": str})
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+
+for col in ["total_customer_hours", "peak_customers_out_p90"]:
+    if col not in agg.columns:
+        raise ValueError(f"'{col}' missing from aggregate file")
+
+parts = []
+years = sorted(int(p) for p in yearly["period"].unique() if str(p).isdigit())
+for yr in years:
+    g = yearly[yearly["period"] == str(yr)]
+    out = build_burden(g, str(yr), mcc_map)
+    out.to_csv(f"{BY_PERIOD_DIR}/burden_component_{yr}.csv", index=False)
+    parts.append(out)
+    nflag = int(out["mcc_flag"].sum())
+    print(f"  {yr}: {len(out):,} counties, capped(flagged)={nflag}, "
+          f"B_c median={out['B_c'].median():.3f}")
+
+out_pooled = build_burden(agg, "2015_2025", mcc_map)
+out_pooled.to_csv(f"{BY_PERIOD_DIR}/burden_component_2015_2025.csv", index=False)
+parts.append(out_pooled)
+print(f"  pooled: {len(out_pooled):,} counties, "
+      f"capped(flagged)={int(out_pooled['mcc_flag'].sum())}, "
+      f"B_c median={out_pooled['B_c'].median():.3f}")
+
+combined = pd.concat(parts, ignore_index=True)
+combined.to_csv(f"{OUT_DIR}/burden_component_by_period.csv", index=False)
+
+print(f"\nWrote:\n  {OUT_DIR}/burden_component_by_period.csv ({len(combined):,} rows)")
+print(f"  {BY_PERIOD_DIR}/burden_component_<period>.csv  (12 files)")
+
+print("\nTop 10 counties by pooled normalized burden (B_c*):")
+print(out_pooled.head(10)[["county_fips", "county_name", "state",
+                           "B_c", "B_c_star", "mcc_flag"]].to_string(index=False))
