@@ -1,0 +1,198 @@
+"""
+Section 3 — Consolidated county risk input file
+================================================
+Builds one county-level file (county_risk_input.csv) holding the three main
+risk dimensions plus the peak sensitivity variable, each as a raw value and a
+0-100 percentile, using cap1 MCC normalization.
+
+Columns:
+    state, county_fips, county_name,
+    storm_exposure_count        number of storm exposures            (E_c)
+    total_customer_hours         absolute customer-hour burden
+    total_customers_served       county customer denominator (MCC)
+    normalized_customer_hours    customer-hours per customer served   (B_c, cap1)
+    p90_recovery_duration_hr     P90 recovery duration                (D_c)
+    p90_peak_outage              peak outage metric (count)           (P_c)
+    buffer_hr                    attribution buffer used (= 12)
+    dominant_hazard              most frequent linked storm type (optional)
+    E_pct  percentile rank of storm_exposure_count
+    B_pct  percentile rank of normalized_customer_hours
+    D_pct  percentile rank of p90_recovery_duration_hr
+    P_pct  percentile rank of p90_peak_outage
+All percentiles in [0, 100] (average-rank; NaN/zero ranked at the bottom).
+
+Primary output (pooled 2015-2025): Results/Q3/county_risk_input.csv
+Per-year copies:                    Results/Q3/by_period/county_risk_input_{year}.csv
+
+Requires: pandas, numpy
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+OUT_DIR = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{OUT_DIR}/by_period"
+os.makedirs(BY_PERIOD_DIR, exist_ok=True)
+
+AGG_CSV = f"{Q1_3}/county_metric_comparison_2015_2025.csv"
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+
+BUFFER_HR = 12   # attribution buffer used by the main pipeline (+/-12h)
+
+# storm records saved by the Q1 pipeline (for dominant_hazard); search a few spots
+STORM_REC_CANDIDATES = [
+    f"{Q1_3}/county_level_storm_records_2015_2025.csv",
+    f"{BASE}/Power_Outage_ZeroFill/Results/Q1_2/county_level_storm_records_2015_2025.csv",
+    f"{BASE}/Power_Outage_ZeroFill/Results/Q1/county_level_storm_records_2015_2025.csv",
+]
+
+STORM_MAP = {
+    "Thunderstorm Wind": "Thunderstorm Wind", "Lightning": "Thunderstorm Wind",
+    "Hail": "Thunderstorm Wind",
+    "Winter Storm": "Winter Storm", "Winter Weather": "Winter Storm",
+    "Blizzard": "Winter Storm", "Ice Storm": "Winter Storm",
+    "Heavy Snow": "Winter Storm", "Sleet": "Winter Storm",
+    "Lake-Effect Snow": "Winter Storm", "Cold/Wind Chill": "Winter Storm",
+    "Extreme Cold/Wind Chill": "Winter Storm", "Frost/Freeze": "Winter Storm",
+    "Flood": "Flood", "Flash Flood": "Flood", "Coastal Flood": "Flood",
+    "Storm Surge/Tide": "Flood",
+    "High Wind": "High Wind", "Strong Wind": "High Wind",
+    "Hurricane": "Hurricane", "Hurricane (Typhoon)": "Hurricane",
+    "Tropical Storm": "Hurricane", "Tropical Depression": "Hurricane",
+    "Tornado": "Tornado", "Funnel Cloud": "Tornado", "Waterspout": "Tornado",
+    "Heavy Rain": "Heavy Rain", "Excessive Rainfall": "Heavy Rain",
+    "Wildfire": "Wildfire",
+    "Excessive Heat": "Heat/Drought", "Heat": "Heat/Drought",
+    "Drought": "Heat/Drought",
+}
+
+
+def pctl(series):
+    return series.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def load_dominant_hazard():
+    """Return dict keyed by (county_fips, year) and (county_fips, 'all') ->
+    dominant grouped storm type. Empty if no storm-records file is found."""
+    path = next((p for p in STORM_REC_CANDIDATES if os.path.exists(p)), None)
+    if path is None:
+        print("  (no county_level_storm_records file found; "
+              "dominant_hazard left blank)")
+        return {}, {}
+    print(f"  dominant_hazard source: {path}")
+    s = pd.read_csv(path, dtype={"county_fips": str})
+    s["county_fips"] = s["county_fips"].str.zfill(5)
+    s["grp"] = s["event_type"].map(STORM_MAP).fillna("Other")
+
+    def _mode(series):
+        m = series.mode()
+        return m.iloc[0] if len(m) else np.nan
+
+    by_year = (s.groupby(["county_fips", "year"])["grp"].agg(_mode).to_dict())
+    by_all = (s.groupby("county_fips")["grp"].agg(_mode).to_dict())
+    return by_year, by_all
+
+
+def build_risk_input(df, period_label, mcc_map, dom_year, dom_all):
+    d = df.copy()
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+
+    d["storm_exposure_count"] = pd.to_numeric(d["storm_exposure_count"],
+                                              errors="coerce").fillna(0)
+    d["total_customer_hours"] = pd.to_numeric(d["total_customer_hours"],
+                                              errors="coerce")
+    d["total_customers_served"] = pd.to_numeric(
+        d["county_fips"].map(mcc_map), errors="coerce")
+    d.loc[d["total_customers_served"] <= 0, "total_customers_served"] = np.nan
+
+    peak = pd.to_numeric(d["peak_customers_out_p90"], errors="coerce")
+    flag = (d["total_customers_served"] < peak).fillna(False)
+    d["normalized_customer_hours"] = (
+        d["total_customer_hours"] / d["total_customers_served"]
+    ).replace([np.inf, -np.inf], np.nan)
+    maxB = d["normalized_customer_hours"].max()
+    d.loc[flag, "normalized_customer_hours"] = maxB
+
+    d["p90_recovery_duration_hr"] = pd.to_numeric(d["p90_recovery_hr"],
+                                                  errors="coerce")
+    d["p90_peak_outage"] = peak
+    d["buffer_hr"] = BUFFER_HR
+
+    # dominant hazard
+    if period_label == "2015_2025":
+        d["dominant_hazard"] = d["county_fips"].map(dom_all)
+    else:
+        yr = int(period_label)
+        d["dominant_hazard"] = d["county_fips"].map(
+            lambda f: dom_year.get((f, yr), np.nan))
+
+    # percentiles (0-100)
+    d["E_pct"] = pctl(d["storm_exposure_count"])
+    d["B_pct"] = pctl(d["normalized_customer_hours"])
+    d["D_pct"] = pctl(d["p90_recovery_duration_hr"])
+    d["P_pct"] = pctl(d["p90_peak_outage"])
+
+    cols = ["period", "state", "county_fips", "county_name",
+            "storm_exposure_count", "total_customer_hours",
+            "total_customers_served", "normalized_customer_hours",
+            "p90_recovery_duration_hr", "p90_peak_outage",
+            "buffer_hr", "dominant_hazard",
+            "E_pct", "B_pct", "D_pct", "P_pct"]
+    d["period"] = period_label
+    out = d[cols].copy()
+    return out.sort_values(["county_fips"]).reset_index(drop=True)
+
+
+print("Loading inputs ...")
+mcc_map = load_mcc(MCC_CSV)
+print(f"MCC counties: {len(mcc_map):,}")
+dom_year, dom_all = load_dominant_hazard()
+
+agg = pd.read_csv(AGG_CSV, dtype={"county_fips": str})
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+
+required = ["storm_exposure_count", "total_customer_hours",
+            "peak_customers_out_p90", "p90_recovery_hr"]
+for c in required:
+    if c not in agg.columns:
+        raise ValueError(f"'{c}' missing from aggregate file")
+
+# pooled (primary deliverable)
+pooled = build_risk_input(agg, "2015_2025", mcc_map, dom_year, dom_all)
+pooled.to_csv(f"{OUT_DIR}/county_risk_input.csv", index=False)
+print(f"\nPrimary: {OUT_DIR}/county_risk_input.csv  ({len(pooled):,} counties)")
+
+# per-year copies
+years = sorted(int(p) for p in yearly["period"].unique() if str(p).isdigit())
+for yr in years:
+    g = yearly[yearly["period"] == str(yr)]
+    out = build_risk_input(g, str(yr), mcc_map, dom_year, dom_all)
+    out.to_csv(f"{BY_PERIOD_DIR}/county_risk_input_{yr}.csv", index=False)
+print(f"Per-year: {BY_PERIOD_DIR}/county_risk_input_<year>.csv  ({len(years)} files)")
+
+print("\nColumn dtypes / non-null counts (pooled):")
+print(pooled.dtypes.to_string())
+print(f"\ndominant_hazard non-null: {pooled['dominant_hazard'].notna().sum():,}"
+      f" of {len(pooled):,}")
+print("\nPreview (pooled, top 5 by B_pct):")
+prev = pooled.sort_values("B_pct", ascending=False).head(5)[
+    ["county_fips", "county_name", "state", "storm_exposure_count",
+     "normalized_customer_hours", "E_pct", "B_pct", "D_pct", "P_pct"]]
+print(prev.to_string(index=False))
