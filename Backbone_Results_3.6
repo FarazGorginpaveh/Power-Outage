@@ -1,0 +1,179 @@
+"""
+Section 4 — Baseline experiment: equal-weight risk score
+========================================================
+Transparent reference score, equal weights on the three main dimensions:
+
+    R_base = (E_c* + B_c* + D_c*) / 3
+
+    E_c* = storm exposure percentile        (E_pct)
+    B_c* = normalized customer-hour burden   (B_pct)
+    D_c* = P90 recovery percentile           (D_pct)
+
+The peak variable P_pct is NOT used here (sensitivity only).
+
+R_base is then itself converted to a risk percentile, and counties are
+classified:
+    risk percentile 0-50   low
+                    50-75  moderate
+                    75-90  high
+                    90-100 very high
+
+Deliverables:
+  1. county_risk_baseline.csv          (R_base, its percentile, risk class)
+  2. fig_map_baseline_risk.png         choropleth of R_base
+  3. table of county counts by risk class  (printed + risk_class_counts.csv)
+  4. top 25 counties by baseline risk      (printed + top25_baseline_risk.csv)
+
+Done for pooled 2015-2025 (primary) and each year (by_period/).
+
+Reads:  Results/Q3/county_risk_input.csv               (pooled)
+        Results/Q3/by_period/county_risk_input_{yr}.csv (per year)
+        shapefile cb_2022_us_county_5m.shp
+Writes: Results/Q3/  (and Results/Q3/by_period/, Results/Q3/figures/)
+
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+BY_PERIOD_DIR = f"{Q3}/by_period"
+FIG_DIR = f"{Q3}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 300
+plt.rcParams.update({"figure.facecolor": "white", "font.size": 10})
+
+# risk classes by risk *percentile* of R_base
+CLASS_BINS = [0, 50, 75, 90, 100.0001]
+CLASS_LABELS = ["low", "moderate", "high", "very high"]
+CLASS_COLORS = {
+    "low": "#fee5d9", "moderate": "#fcae91",
+    "high": "#fb6a4a", "very high": "#a50f15",
+}
+
+
+def classify(df):
+    """Add R_base, its percentile, and risk class. Equal-weight mean of the
+    three component percentiles."""
+    d = df.copy()
+    d["R_base"] = d[["E_pct", "B_pct", "D_pct"]].mean(axis=1)
+    d["R_base_percentile"] = d["R_base"].rank(pct=True, method="average") * 100.0
+    d["risk_class"] = pd.cut(d["R_base_percentile"], bins=CLASS_BINS,
+                             labels=CLASS_LABELS, include_lowest=True,
+                             right=True)
+    return d
+
+
+def class_counts(d):
+    c = d["risk_class"].value_counts().reindex(CLASS_LABELS, fill_value=0)
+    out = c.rename("n_counties").to_frame()
+    out["pct_of_counties"] = (out["n_counties"] / len(d) * 100).round(1)
+    out.index.name = "risk_class"
+    return out.reset_index()
+
+
+# ============================================================
+# pooled (primary) + per-year
+# ============================================================
+
+def process(path, period_label, make_fig):
+    df = pd.read_csv(path, dtype={"county_fips": str})
+    df["county_fips"] = df["county_fips"].str.zfill(5)
+    d = classify(df)
+
+    if period_label == "2015_2025":
+        d.to_csv(f"{Q3}/county_risk_baseline.csv", index=False)
+        cc = class_counts(d)
+        cc.to_csv(f"{Q3}/risk_class_counts.csv", index=False)
+        top25 = d.sort_values("R_base", ascending=False).head(25)
+        top25.to_csv(f"{Q3}/top25_baseline_risk.csv", index=False)
+    else:
+        d.to_csv(f"{BY_PERIOD_DIR}/county_risk_baseline_{period_label}.csv",
+                 index=False)
+
+    if make_fig:
+        gdf = gpd.read_file(SHP_PATH)
+        gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+        gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+        gdf = gdf.to_crs("EPSG:5070")
+        geo = gdf.merge(d, on="county_fips", how="left")
+
+        # continuous R_base map
+        fig, ax = plt.subplots(figsize=(13, 8))
+        geo.plot(column="R_base", cmap="inferno_r", linewidth=0.05,
+                 edgecolor="white", legend=True, ax=ax,
+                 missing_kwds={"color": MISSING_COLOR, "label": "No data"},
+                 legend_kwds={"shrink": 0.6, "label": "Baseline risk score R_base (0-100)"})
+        ax.set_axis_off()
+        ax.set_title("Baseline equal-weight storm-disruption risk score, 2015-2025\n"
+                     "R_base = mean(storm exposure, normalized burden, "
+                     "P90 recovery) percentiles", fontsize=13, pad=10)
+        fig.tight_layout()
+        fig.savefig(f"{FIG_DIR}/fig_map_baseline_risk.png", dpi=DPI)
+        plt.close(fig)
+
+        # classified map
+        fig, ax = plt.subplots(figsize=(13, 8))
+        cmap = ListedColormap([CLASS_COLORS[c] for c in CLASS_LABELS])
+        geo_c = geo.copy()
+        geo_c["cls_code"] = pd.Categorical(
+            geo_c["risk_class"], categories=CLASS_LABELS).codes
+        geo_c.loc[geo_c["cls_code"] < 0, "cls_code"] = np.nan
+        geo_c.plot(column="cls_code", cmap=cmap, vmin=0, vmax=3,
+                   linewidth=0.05, edgecolor="white", ax=ax,
+                   missing_kwds={"color": MISSING_COLOR})
+        handles = [mpatches.Patch(color=CLASS_COLORS[c],
+                   label=f"{c} (n={int((d['risk_class'] == c).sum()):,})")
+                   for c in CLASS_LABELS]
+        handles.append(mpatches.Patch(facecolor=MISSING_COLOR, hatch="///",
+                                      label="No data"))
+        ax.legend(handles=handles, loc="lower right", fontsize=9, framealpha=0.95)
+        ax.set_axis_off()
+        ax.set_title("Baseline risk class by county, 2015-2025\n"
+                     "(low / moderate / high / very high)", fontsize=13, pad=10)
+        fig.tight_layout()
+        fig.savefig(f"{FIG_DIR}/fig_map_baseline_risk_class.png", dpi=DPI)
+        plt.close(fig)
+
+    return d
+
+
+print("Building baseline risk score ...")
+pooled = process(f"{Q3}/county_risk_input.csv", "2015_2025", make_fig=True)
+
+import glob
+for f in sorted(glob.glob(f"{BY_PERIOD_DIR}/county_risk_input_*.csv")):
+    yr = f.split("_")[-1].replace(".csv", "")
+    if yr.isdigit():
+        process(f, yr, make_fig=False)
+
+# ---- deliverable 3: class counts ----
+cc = class_counts(pooled)
+print("\n[3] County counts by risk class (pooled 2015-2025):")
+print(cc.to_string(index=False))
+
+# ---- deliverable 4: top 25 ----
+print("\n[4] Top 25 counties by baseline risk (pooled):")
+top25 = pooled.sort_values("R_base", ascending=False).head(25)
+print(top25[["county_fips", "county_name", "state",
+             "E_pct", "B_pct", "D_pct", "R_base", "risk_class"]]
+      .round(1).to_string(index=False))
+
+print(f"\nDeliverables written to {Q3}:")
+print("  county_risk_baseline.csv, risk_class_counts.csv, top25_baseline_risk.csv")
+print(f"  figures/fig_map_baseline_risk.png (+ _class.png)")
+print(f"  by_period/county_risk_baseline_<year>.csv")
