@@ -1,0 +1,192 @@
+"""
+Section 10 — Peak-inclusion sensitivity experiment
+===================================================
+Reviewers may ask why P90 peak outage is excluded from the main score. This
+runs the direct check: add peak as a fourth EQUAL-weight dimension and see if
+the ranking changes.
+
+    R_base = (E* + B* + D*) / 3            (3-dim main score)
+    R_4c   = (E* + B* + D* + P*) / 4       (4-dim, peak added, equal weights)
+        P* = Pctl(P90 peak outage)         ( = P_pct )
+
+Compare R_base vs R_4c and report:
+    1. Spearman rank correlation
+    2. Top-10% overlap
+    3. Counties that change risk class (low/moderate/high/very high)
+    4. Whether peak adds a substantially different dimension (interpretation)
+
+Interpretation rule:
+    high rho AND high top-10 overlap   -> three-variable score is robust
+    moderate rho, different hotspots    -> peak captures a distinct intensity dim
+    low rho                             -> main score may be incomplete
+
+NOTE: this is EQUAL-weight 4-dim, different from the 4-dim LHS sweep (which
+varies the weights). Both are legitimate peak sensitivities; this one answers
+the specific reviewer question "what if peak were simply added in?".
+
+Outputs (Q3_2):
+    risk_peak_sensitivity.csv           summary table (the reported metrics)
+    risk_peak_class_changes.csv         per-county class change detail
+    figures/fig_peak_sensitivity.png    R_base vs R_4c scatter + class-change map-free view
+
+Reads:  county_risk_input.csv  (E_pct, B_pct, D_pct, P_pct)   [Q3_2, then Q3]
+Requires: pandas, numpy, matplotlib, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+OUT_DIR = Q3_2
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+TOP_FRAC = 0.10
+CLASS_BINS = [0, 50, 75, 90, 100.0001]
+CLASS_LABELS = ["low", "moderate", "high", "very high"]
+
+# interpretation thresholds (heuristic; adjust if you prefer stricter bands)
+HIGH_RHO = 0.90
+HIGH_OVERLAP = 0.80
+MOD_RHO = 0.70
+
+
+def find_input(fname):
+    for base_dir in (Q3_2, Q3):
+        p = f"{base_dir}/{fname}"
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def pct_class(score):
+    """score -> percentile -> risk class (same rule as the baseline)."""
+    p = score.rank(pct=True, method="average") * 100.0
+    cls = pd.cut(p, bins=CLASS_BINS, labels=CLASS_LABELS,
+                 include_lowest=True, right=True)
+    return p, cls
+
+
+# ---- load ----
+src = find_input("county_risk_input.csv")
+if src is None:
+    raise FileNotFoundError("county_risk_input.csv not found in Q3_2 or Q3")
+print(f"input: {src}")
+
+d = pd.read_csv(src, dtype={"county_fips": str})
+d["county_fips"] = d["county_fips"].str.zfill(5)
+for c in ["E_pct", "B_pct", "D_pct", "P_pct"]:
+    d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+n = len(d)
+k = int(np.ceil(TOP_FRAC * n))
+print(f"counties: {n:,} | top-10% size k = {k:,}")
+
+# ---- scores ----
+d["R_base"] = d[["E_pct", "B_pct", "D_pct"]].mean(axis=1)
+d["R_4c"] = d[["E_pct", "B_pct", "D_pct", "P_pct"]].mean(axis=1)
+d["R_base_pct"], d["class_base"] = pct_class(d["R_base"])
+d["R_4c_pct"], d["class_4c"] = pct_class(d["R_4c"])
+
+# ---- 1. Spearman ----
+rho, pval = spearmanr(d["R_base"], d["R_4c"], nan_policy="omit")
+
+# bonus: how correlated is peak itself with the 3-dim score?
+rho_peak, _ = spearmanr(d["P_pct"], d["R_base"], nan_policy="omit")
+
+# ---- 2. top-10% overlap ----
+T_base = set(d.nlargest(k, "R_base")["county_fips"])
+T_4c = set(d.nlargest(k, "R_4c")["county_fips"])
+overlap_n = len(T_base & T_4c)
+overlap_pct = overlap_n / k
+entering = T_4c - T_base
+leaving = T_base - T_4c
+
+# ---- 3. class changes ----
+d["class_changed"] = d["class_base"].astype(str) != d["class_4c"].astype(str)
+n_changed = int(d["class_changed"].sum())
+pct_changed = n_changed / n * 100
+
+# ---- 4. interpretation ----
+if rho >= HIGH_RHO and overlap_pct >= HIGH_OVERLAP:
+    interp = ("high correlation and high top-10 overlap -> the three-variable "
+              "score is robust; adding peak does not materially change it")
+elif rho >= MOD_RHO:
+    interp = ("moderate correlation with shifted hotspots -> peak captures a "
+              "distinct intensity dimension not fully reflected by E, B, D")
+else:
+    interp = ("low correlation -> the main score may be incomplete without peak")
+
+# ---- summary CSV ----
+summary = pd.DataFrame([
+    {"Metric": "Spearman R_base vs R_4c",
+     "Value": f"{rho:.4f}  (p = {pval:.2e})"},
+    {"Metric": "Top 10% overlap (R_base vs R_4c)",
+     "Value": f"{overlap_n:,} / {k:,}  ({overlap_pct*100:.1f}%)"},
+    {"Metric": "Counties entering top 10% when peak added",
+     "Value": str(len(entering))},
+    {"Metric": "Counties leaving top 10% when peak added",
+     "Value": str(len(leaving))},
+    {"Metric": "Counties changing risk class",
+     "Value": f"{n_changed:,} ({pct_changed:.1f}%)"},
+    {"Metric": "Spearman peak (P*) vs R_base  (peak alignment)",
+     "Value": f"{rho_peak:.4f}"},
+    {"Metric": "Interpretation", "Value": interp},
+])
+summary.to_csv(f"{OUT_DIR}/risk_peak_sensitivity.csv", index=False)
+
+print("\nPeak-inclusion sensitivity summary:")
+print(summary.to_string(index=False))
+
+# ---- per-county class-change detail ----
+chg = d[d["class_changed"]][
+    ["county_fips", "county_name", "state",
+     "E_pct", "B_pct", "D_pct", "P_pct",
+     "R_base", "class_base", "R_4c", "class_4c"]].copy()
+chg["direction"] = np.where(
+    chg["class_4c"].astype(str).map({l: i for i, l in enumerate(CLASS_LABELS)})
+    > chg["class_base"].astype(str).map({l: i for i, l in enumerate(CLASS_LABELS)}),
+    "up (peak raises class)", "down (peak lowers class)")
+chg = chg.sort_values(["direction", "state", "county_fips"])
+chg.to_csv(f"{OUT_DIR}/risk_peak_class_changes.csv", index=False)
+print(f"\nClass-change detail: {len(chg):,} counties "
+      f"-> {OUT_DIR}/risk_peak_class_changes.csv")
+
+# class transition table (base -> 4c)
+trans = pd.crosstab(d["class_base"], d["class_4c"],
+                    rownames=["baseline class"], colnames=["4-dim class"])
+trans = trans.reindex(index=CLASS_LABELS, columns=CLASS_LABELS, fill_value=0)
+print("\nClass transition (rows = baseline, cols = with peak):")
+print(trans.to_string())
+
+# ---- figure: R_base vs R_4c scatter, class changes highlighted ----
+fig, ax = plt.subplots(figsize=(8.5, 8))
+same = ~d["class_changed"]
+ax.scatter(d.loc[same, "R_base"], d.loc[same, "R_4c"], s=12, alpha=0.5,
+           color="#9ecae1", edgecolors="none", label="class unchanged")
+ax.scatter(d.loc[d["class_changed"], "R_base"], d.loc[d["class_changed"], "R_4c"],
+           s=16, alpha=0.8, color="#d73027", edgecolors="none",
+           label="class changed")
+ax.plot([0, 100], [0, 100], ls="--", lw=1, color="black", alpha=0.6,
+        label="R_base = R_4c")
+ax.set_xlabel("R_base = (E* + B* + D*) / 3")
+ax.set_ylabel("R_4c = (E* + B* + D* + P*) / 4")
+ax.set_title(f"Peak-inclusion sensitivity\n"
+             f"Spearman rho = {rho:.3f}  |  top-10% overlap = {overlap_pct*100:.1f}%"
+             f"  |  {n_changed:,} class changes")
+ax.legend(loc="lower right", fontsize=8)
+ax.set_xlim(-2, 102)
+ax.set_ylim(-2, 102)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_peak_sensitivity.png", dpi=300)
+plt.close(fig)
+print(f"\nWrote:\n  {OUT_DIR}/risk_peak_sensitivity.csv")
+print(f"  {OUT_DIR}/risk_peak_class_changes.csv")
+print(f"  {FIG_DIR}/fig_peak_sensitivity.png")
