@@ -1,0 +1,246 @@
+"""
+Section 8 — Weight-sensitivity diagnostics  (3-DIM headline version, self-contained)
+====================================================================================
+This is the MAIN weight-sensitivity test: weights vary over the same three
+dimensions the baseline uses (E, B, D). Peak is NOT included, so this isolates
+the effect of the WEIGHTS only (unlike the 4-dim run, which also adds peak).
+
+Self-contained: it does not need county_risk_final_*.csv. It reads the county
+components from county_risk_input.csv, rebuilds R_base = mean(E*,B*,D*), runs its
+own K-scenario LHS sweep over the 3 dimensions, then reports:
+
+  8.1 Spearman(R_base, R_lhs_mean)
+  8.2 Top-10% overlap(R_base, R_lhs_mean)
+  8.3 DeltaRank = Rank(R_base) - Rank(R_lhs_mean)   (rank 1 = highest risk)
+        DeltaRank > 0 -> ranks HIGHER (more risk) under LHS mean
+  Hotspot counts from P_VH (fraction of scenarios in the top 10%):
+        robust >= 0.90 | moderate 0.50-0.90 | weight-sensitive 0.10-0.50
+
+Burden note: B* is recomputed here with the corrected cap (saturated county ->
+max burden, percentile forced to 100), so results are correct even if Section 3
+still has the 1.0 cap. Set RECOMPUTE_BURDEN=False to use the file's B_pct as-is.
+
+Outputs (Q3_2):
+    risk_weight_sensitivity_summary_3dim.csv
+    risk_weight_sensitivity_county_3dim.csv
+    figures/fig_rank_shift_histogram_3dim.png
+    figures/fig_rank_shift_map_3dim.png
+    figures/fig_base_vs_lhsmean_scatter_3dim.png
+
+Reads:  county_risk_input.csv  (E_pct, B_pct, D_pct, and raw burden columns)
+        MCC.csv (only if RECOMPUTE_BURDEN and served not in the file)
+        shapefile (for the map)
+Requires: pandas, numpy, matplotlib, geopandas, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+from scipy.stats import spearmanr
+from scipy.stats.qmc import LatinHypercube
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+OUT_DIR = Q3_2
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 300
+plt.rcParams.update({"figure.facecolor": "white", "font.size": 10})
+
+DIMS = ["E_pct", "B_pct", "D_pct"]        # 3-dim
+K = 1000
+SEED = 42
+TOP_FRAC = 0.10
+RECOMPUTE_BURDEN = True                     # corrected cap; False = use file B_pct
+MAKE_MAP = True
+
+
+def find_input(fname):
+    for base_dir in (Q3_2, Q3):
+        p = f"{base_dir}/{fname}"
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def pctl(s):
+    return s.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+# ---- load county components ----
+src = find_input("county_risk_input.csv")
+if src is None:
+    raise SystemExit("county_risk_input.csv not found in Q3_2 or Q3")
+print(f"input: {src}")
+d = pd.read_csv(src, dtype={"county_fips": str})
+d["county_fips"] = d["county_fips"].str.zfill(5)
+d["E_pct"] = pd.to_numeric(d["E_pct"], errors="coerce").fillna(0)
+d["D_pct"] = pd.to_numeric(d["D_pct"], errors="coerce").fillna(0)
+
+# burden: recompute with corrected cap, or use file's B_pct
+if RECOMPUTE_BURDEN:
+    ch = pd.to_numeric(d["total_customer_hours"], errors="coerce")
+    if "total_customers_served" in d.columns:
+        served = pd.to_numeric(d["total_customers_served"], errors="coerce")
+    else:
+        served = d["county_fips"].map(load_mcc(MCC_CSV)).astype(float)
+    served = served.where(served > 0, np.nan)
+    peak = pd.to_numeric(d["p90_peak_outage"], errors="coerce")
+    flag = (served < peak).fillna(False)
+    B = (ch / served).replace([np.inf, -np.inf], np.nan)
+    maxB = B[~flag].max()
+    B = B.where(~flag, maxB)
+    d["B_pct"] = pctl(B)
+    d.loc[flag.values, "B_pct"] = 100.0
+    print(f"burden recomputed with corrected cap ({int(flag.sum())} saturated)")
+else:
+    d["B_pct"] = pd.to_numeric(d["B_pct"], errors="coerce").fillna(0)
+    print("using file B_pct as-is")
+
+n = len(d)
+X = d[DIMS].to_numpy()
+d["R_base"] = X.mean(axis=1)                         # equal-weight 3-dim
+print(f"counties: {n:,}")
+
+# ---- LHS sweep over 3 dims ----
+u = LatinHypercube(d=3, seed=SEED).random(n=K)
+e = -np.log(1.0 - u)
+W = e / e.sum(axis=1, keepdims=True)                 # (K,3) simplex
+scores = W @ X.T                                     # (K, n)
+order = np.argsort(-scores, axis=1)
+ranks = np.empty_like(order)
+ranks[np.arange(K)[:, None], order] = np.arange(1, n + 1)[None, :]
+k_vh = max(1, int(np.ceil(TOP_FRAC * n)))
+d["P_VH"] = (ranks <= k_vh).mean(axis=0)
+d["R_lhs_mean"] = scores.mean(axis=0)
+
+# ---- 8.1 Spearman ----
+rho, pval = spearmanr(d["R_base"], d["R_lhs_mean"], nan_policy="omit")
+
+# ---- 8.2 top-10% overlap ----
+k = int(np.ceil(TOP_FRAC * n))
+T_base = set(d.nlargest(k, "R_base")["county_fips"])
+T_lhs = set(d.nlargest(k, "R_lhs_mean")["county_fips"])
+overlap_n = len(T_base & T_lhs)
+overlap_pct = overlap_n / k
+
+# ---- 8.3 rank shift (corrected sign) ----
+d["rank_base"] = d["R_base"].rank(ascending=False, method="min")
+d["rank_lhs_mean"] = d["R_lhs_mean"].rank(ascending=False, method="min")
+d["DeltaRank"] = d["rank_base"] - d["rank_lhs_mean"]
+d["abs_DeltaRank"] = d["DeltaRank"].abs()
+
+n_robust = int((d["P_VH"] >= 0.90).sum())
+n_moderate = int(((d["P_VH"] >= 0.50) & (d["P_VH"] < 0.90)).sum())
+n_sensitive = int(((d["P_VH"] >= 0.10) & (d["P_VH"] < 0.50)).sum())
+
+summary = pd.DataFrame([
+    {"Metric": "Spearman baseline vs LHS mean",
+     "Value": f"{rho:.4f}  (p = {pval:.2e})"},
+    {"Metric": "Top 10% overlap baseline vs LHS mean",
+     "Value": f"{overlap_n:,} / {k:,}  ({overlap_pct*100:.1f}%)"},
+    {"Metric": "Number of robust hotspots  P_VH >= 0.90", "Value": str(n_robust)},
+    {"Metric": "Number of moderate hotspots  P_VH 0.50-0.90", "Value": str(n_moderate)},
+    {"Metric": "Number of weight-sensitive hotspots  P_VH 0.10-0.50",
+     "Value": str(n_sensitive)},
+])
+summary.to_csv(f"{OUT_DIR}/risk_weight_sensitivity_summary_3dim.csv", index=False)
+print("\n3-DIM weight-sensitivity summary:")
+print(summary.to_string(index=False))
+
+d[["county_fips", "county_name", "state", "E_pct", "B_pct", "D_pct",
+   "R_base", "R_lhs_mean", "rank_base", "rank_lhs_mean", "DeltaRank",
+   "abs_DeltaRank", "P_VH"]].to_csv(
+    f"{OUT_DIR}/risk_weight_sensitivity_county_3dim.csv", index=False)
+
+# ---- Figure 1: histogram ----
+fig, ax = plt.subplots(figsize=(9, 5.5))
+ax.hist(d["DeltaRank"], bins=60, color="#4575b4", edgecolor="white",
+        linewidth=0.3, alpha=0.9)
+ax.axvline(0, color="black", lw=1.2, label="No shift (ΔRank = 0)")
+for q in (0.05, 0.95):
+    v = d["DeltaRank"].quantile(q)
+    ax.axvline(v, color="#d73027", ls="--", lw=1,
+               label=f"{int(q*100)}th pct = {v:.0f}")
+ax.set_xlabel("ΔRank = Rank(R_base) − Rank(R_lhs_mean)\n"
+              "Positive = ranks higher (more risk) under LHS mean")
+ax.set_ylabel("Number of counties")
+ax.set_title("Rank shift: baseline vs LHS mean (3-dim, E/B/D)\n"
+             "Centred, symmetric = no systematic bias")
+ax.legend(fontsize=8)
+ax.grid(alpha=0.3)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_rank_shift_histogram_3dim.png", dpi=DPI)
+plt.close(fig)
+
+# ---- Figure 3: scatter ----
+fig, ax = plt.subplots(figsize=(8.5, 8))
+sc = ax.scatter(d["R_base"], d["R_lhs_mean"], c=d["abs_DeltaRank"],
+                cmap="viridis_r", s=14, alpha=0.7, edgecolors="none",
+                vmin=0, vmax=d["abs_DeltaRank"].quantile(0.95))
+ax.plot([0, 100], [0, 100], ls="--", lw=1, color="black", alpha=0.6,
+        label="Perfect agreement (ΔRank = 0)")
+cb = fig.colorbar(sc, ax=ax, shrink=0.85)
+cb.set_label("|ΔRank| (rank-shift magnitude)")
+ax.set_xlabel("R_base (equal-weight baseline, 3-dim)")
+ax.set_ylabel(f"R_lhs_mean (mean over {K:,} LHS scenarios, 3-dim)")
+ax.set_title(f"Baseline vs LHS mean (3-dim)\n"
+             f"Spearman rho = {rho:.3f}  |  top-10% overlap = {overlap_pct*100:.1f}%")
+ax.legend(loc="lower right", fontsize=8)
+ax.set_xlim(-2, 102)
+ax.set_ylim(-2, 102)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_base_vs_lhsmean_scatter_3dim.png", dpi=DPI)
+plt.close(fig)
+
+# ---- Figure 2: map ----
+if MAKE_MAP:
+    try:
+        gdf = gpd.read_file(SHP_PATH)
+        gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+        gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+        gdf = gdf.to_crs("EPSG:5070")
+        geo = gdf.merge(d, on="county_fips", how="left")
+        fig, ax = plt.subplots(figsize=(13, 8))
+        abs_max = max(1.0, d["DeltaRank"].abs().quantile(0.97))
+        norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+        geo.plot(column="DeltaRank", cmap="RdBu_r", norm=norm, linewidth=0.05,
+                 edgecolor="white", legend=True, ax=ax,
+                 missing_kwds={"color": MISSING_COLOR, "label": "No data"},
+                 legend_kwds={"shrink": 0.6,
+                              "label": "ΔRank = Rank(base) − Rank(LHS mean)"})
+        ax.set_axis_off()
+        ax.set_title("Rank shift, baseline vs LHS mean (3-dim, E/B/D)\n"
+                     "Red = higher risk under LHS (baseline under-estimates); "
+                     "blue = lower", fontsize=12, pad=10)
+        fig.tight_layout()
+        fig.savefig(f"{FIG_DIR}/fig_rank_shift_map_3dim.png", dpi=DPI)
+        plt.close(fig)
+    except Exception as ex:
+        print(f"(map skipped: {ex})")
+
+print(f"\nWrote 3-dim outputs to {OUT_DIR} (suffix _3dim)")
