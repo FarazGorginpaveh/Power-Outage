@@ -1,0 +1,78 @@
+"""
+Build county_metric_comparison at the 6h buffer  (for Section 11)
+=================================================================
+Section 11 needs a per-county metrics file at 6h, but only the 12h aggregate
+exists. The event-level file storm_linked_outage_events_2015_2025.csv carries a
+storm_linked_6h flag and linked_storm_count_6h, so we rebuild the 6h aggregate
+directly from it -- the same columns the 12h county_metric_comparison has:
+
+    storm_exposure_count   = sum(linked_storm_count_6h) over the county's
+                             6h-linked outages   (storms linked within 6h)
+    total_customer_hours   = sum(auc) over 6h-linked outages
+    p90_recovery_hr        = P90(recovery_hr) over 6h-linked outages
+    peak_customers_out_p90 = P90(peak_customers_out) over 6h-linked outages
+
+Writes:
+    {Q1_3}/county_metric_comparison_2015_2025_buffer6.csv
+
+Then set BUFFER_INPUTS[6] in the Section 11 script to this file and re-run
+Section 11, followed by the Section 11 figure script.
+
+NOTE on consistency: this derives the 6h aggregate from the outage side. If the
+existing 12h county_metric_comparison defined storm_exposure_count as a count of
+distinct STORM records (not summed linked counts), tell me and I'll match that
+definition instead. As-is, exposure = storms linked within 6h.
+"""
+import os
+import numpy as np
+import pandas as pd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+LINKED = f"{Q1_3}/storm_linked_outage_events_2015_2025.csv"
+OUT = f"{Q1_3}/county_metric_comparison_2015_2025_buffer6.csv"
+
+BUFFER = 6
+linked_col = f"storm_linked_{BUFFER}h"
+count_col = f"linked_storm_count_{BUFFER}h"
+
+
+def truthy(s):
+    return s.astype(str).str.lower().isin(["true", "1", "1.0", "yes", "t"])
+
+
+def p90(s):
+    s = s.dropna()
+    return float(np.percentile(s, 90)) if len(s) else 0.0
+
+
+df = pd.read_csv(LINKED, dtype={"county_fips": str})
+df["county_fips"] = df["county_fips"].str.zfill(5)
+for c in ["auc", "recovery_hr", "peak_customers_out", count_col]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# keep only outages linked at 6h
+o = df[truthy(df[linked_col])].copy()
+print(f"6h-linked outages: {len(o):,} of {len(df):,}")
+
+# carry county_name/state if present
+name_cols = [c for c in ["county_name", "state"] if c in o.columns]
+names = (o[["county_fips"] + name_cols].drop_duplicates("county_fips")
+         if name_cols else None)
+
+agg = o.groupby("county_fips").agg(
+    storm_exposure_count=(count_col, "sum"),
+    total_customer_hours=("auc", "sum"),
+    p90_recovery_hr=("recovery_hr", p90),
+    peak_customers_out_p90=("peak_customers_out", p90),
+).reset_index()
+
+if names is not None:
+    agg = agg.merge(names, on="county_fips", how="left")
+
+agg["storm_exposure_count"] = agg["storm_exposure_count"].fillna(0)
+agg.to_csv(OUT, index=False)
+print(f"wrote {OUT}  ({len(agg):,} counties)")
+print(agg.head().to_string(index=False))
+print("\nNext: set BUFFER_INPUTS[6] to this file in the Section 11 script, "
+      "re-run Section 11, then the Section 11 figure script.")
