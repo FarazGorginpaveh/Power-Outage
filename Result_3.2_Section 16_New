@@ -1,0 +1,103 @@
+"""
+Section 16 figures — temporal robustness
+========================================
+Reads risk_temporal_robustness.csv (leave-one-out) and risk_temporal_county.csv
+(per-county 16.1 metrics). Separate figures + combined panel.
+
+Outputs (Q3_2/figures):
+  fig16_loo_spearman_by_year.png
+  fig16_appearance_map.png
+  fig16_appearance_hist.png
+  fig16_meanrisk_vs_appearances.png
+  fig16_combined_panel.png
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+FIG_DIR = f"{Q3_2}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+SHP = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS = {"02", "15", "72", "66", "78", "60", "69"}
+MISS = "#bdbdbd"
+
+
+def find(f):
+    for b in (Q3_2, Q3):
+        if os.path.exists(f"{b}/{f}"):
+            return f"{b}/{f}"
+    return None
+
+
+loo = pd.read_csv(find("risk_temporal_robustness.csv"))
+cty = pd.read_csv(find("risk_temporal_county.csv"), dtype={"county_fips": str})
+cty["county_fips"] = cty["county_fips"].str.zfill(5)
+dom_year = int(loo.loc[loo["spearman_full_vs_minus"].idxmin(), "removed_year"])
+minrho = loo["spearman_full_vs_minus"].min()
+nyears = int(cty["n_years"].iloc[0]) if "n_years" in cty.columns else \
+    int(cty["top10_appearances"].max())
+
+gdf = gpd.read_file(SHP)
+gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS)].to_crs("EPSG:5070")
+geo = gdf.merge(cty, on="county_fips", how="left")
+
+
+def loobar(ax):
+    bars = ax.bar(loo["removed_year"].astype(str), loo["spearman_full_vs_minus"],
+                  color="#4575b4", edgecolor="white")
+    ax.bar(str(dom_year), minrho, color="#d73027", edgecolor="white")
+    ax.set_ylim(min(0.8, minrho - 0.02), 1.001)
+    ax.axhline(1.0, color="gray", ls=":", lw=1)
+    ax.set_ylabel("Spearman(R_full, R_minus_year)"); ax.set_xlabel("year removed")
+    ax.set_title("Leave-one-year-out\nlower = more influential (red = most)")
+    for b, v in zip(bars, loo["spearman_full_vs_minus"]):
+        ax.text(b.get_x()+b.get_width()/2, v+0.001, f"{v:.3f}", ha="center", fontsize=7)
+
+
+def appmap(ax):
+    geo.plot(column="top10_appearances", cmap="YlOrRd", vmin=0, vmax=nyears,
+             linewidth=0.05, edgecolor="white", ax=ax, legend=True,
+             missing_kwds={"color": MISS}, legend_kwds={"shrink": 0.6,
+             "label": f"# years in annual top 10% (0–{nyears})"})
+    ax.set_axis_off()
+    ax.set_title("Persistent hotspots\nhow often a county is in the annual top 10%")
+
+
+def apphist(ax):
+    ax.hist(cty["top10_appearances"], bins=np.arange(-0.5, nyears+1.5, 1),
+            color="#fb6a4a", edgecolor="white")
+    ax.set_xlabel("# years in annual top 10%"); ax.set_ylabel("counties")
+    ax.set_title("Distribution of top-10% appearances")
+
+
+def scat(ax):
+    ax.scatter(cty["top10_appearances"], cty["mean_annual_risk"], s=12,
+               alpha=0.5, color="#6a51a3", edgecolors="none")
+    ax.set_xlabel("# years in annual top 10%"); ax.set_ylabel("mean annual risk")
+    ax.set_title("Persistence vs average risk")
+
+
+f, a = plt.subplots(figsize=(10, 5)); loobar(a); f.tight_layout()
+f.savefig(f"{FIG_DIR}/fig16_loo_spearman_by_year.png", dpi=300); plt.close(f)
+f, a = plt.subplots(figsize=(13, 8)); appmap(a); f.tight_layout()
+f.savefig(f"{FIG_DIR}/fig16_appearance_map.png", dpi=300); plt.close(f)
+f, a = plt.subplots(figsize=(7, 5)); apphist(a); f.tight_layout()
+f.savefig(f"{FIG_DIR}/fig16_appearance_hist.png", dpi=300); plt.close(f)
+f, a = plt.subplots(figsize=(7, 6)); scat(a); f.tight_layout()
+f.savefig(f"{FIG_DIR}/fig16_meanrisk_vs_appearances.png", dpi=300); plt.close(f)
+
+fig = plt.figure(figsize=(18, 14))
+loobar(fig.add_subplot(2, 2, 1)); appmap(fig.add_subplot(2, 2, 2))
+apphist(fig.add_subplot(2, 2, 3)); scat(fig.add_subplot(2, 2, 4))
+fig.suptitle("Section 16 — temporal robustness", fontsize=15)
+fig.tight_layout(rect=[0, 0, 1, 0.98])
+fig.savefig(f"{FIG_DIR}/fig16_combined_panel.png", dpi=300); plt.close(fig)
+print(f"wrote 5 figures to {FIG_DIR} (fig16_*)")
