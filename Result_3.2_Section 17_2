@@ -1,0 +1,153 @@
+"""
+Section 17 figures — hazard-specific risk (6h & 12h)
+====================================================
+Reads county_hazard_specific_risk_<b>h.csv, hazard_risk_overlap_<b>h.csv,
+hazard_dominant_among_highrisk_<b>h.csv for each buffer. Separate figures +
+a combined panel per buffer, plus a 6h-vs-12h comparison.
+
+Outputs (Q3_2/figures):
+  fig17_overlap_bars_<b>h.png
+  fig17_dominant_bar_<b>h.png
+  fig17_dominant_map_<b>h.png
+  fig17_combined_panel_<b>h.png
+  fig17_buffer_compare.png
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+FIG_DIR = f"{Q3_2}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+SHP = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS = {"02", "15", "72", "66", "78", "60", "69"}
+MISS = "#bdbdbd"
+BUFFERS = [6, 12]
+HAZ = ["Thunderstorm Wind", "Tropical Cyclone", "Flood", "Tornado", "Winter Storm"]
+HCOLOR = {"Thunderstorm Wind": "#1f78b4", "Tropical Cyclone": "#e31a1c",
+          "Flood": "#33a02c", "Tornado": "#ff7f00", "Winter Storm": "#6a3d9a"}
+
+
+def find(f):
+    for b in (Q3_2, Q3):
+        if os.path.exists(f"{b}/{f}"):
+            return f"{b}/{f}"
+    return None
+
+
+gdf = gpd.read_file(SHP)
+gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS)].to_crs("EPSG:5070")
+
+risk_by_buf, dom_by_buf, ov_by_buf = {}, {}, {}
+for b in BUFFERS:
+    rp = find(f"county_hazard_specific_risk_{b}h.csv")
+    op = find(f"hazard_risk_overlap_{b}h.csv")
+    dp = find(f"hazard_dominant_among_highrisk_{b}h.csv")
+    if rp is None:
+        print(f"buffer {b}h risk file missing; skipping"); continue
+    risk_by_buf[b] = pd.read_csv(rp, dtype={"county_fips": str})
+    risk_by_buf[b]["county_fips"] = risk_by_buf[b]["county_fips"].str.zfill(5)
+    ov_by_buf[b] = pd.read_csv(op) if op else None
+    dom_by_buf[b] = pd.read_csv(dp, dtype={"county_fips": str}) if dp else None
+
+
+def overlap_bars(ax, b):
+    ov = ov_by_buf.get(b)
+    if ov is None:
+        ax.set_visible(False); return
+    x = np.arange(len(ov))
+    ax.bar(x - 0.2, ov["spearman_vs_allhazard"], 0.4, color="#4575b4",
+           label="Spearman vs all-hazard")
+    ax2 = ax.twinx()
+    ax2.bar(x + 0.2, ov["top10_overlap_vs_allhazard_pct"], 0.4, color="#d73027",
+            label="top-10% overlap %")
+    ax.set_xticks(x); ax.set_xticklabels(ov["hazard"], rotation=25, ha="right", fontsize=8)
+    ax.set_ylabel("Spearman", color="#4575b4"); ax.set_ylim(0, 1.02)
+    ax2.set_ylabel("overlap %", color="#d73027"); ax2.set_ylim(0, 102)
+    ax.set_title(f"Hazard vs all-hazard agreement ({b}h)")
+
+
+def dominant_bar(ax, b):
+    dom = dom_by_buf.get(b)
+    if dom is None:
+        ax.set_visible(False); return
+    vc = dom["dominant_hazard"].value_counts()
+    order = [h for h in HAZ if h in vc.index] + \
+            [h for h in vc.index if h not in HAZ]
+    vals = [vc.get(h, 0) for h in order]
+    ax.bar(order, vals, color=[HCOLOR.get(h, "#888888") for h in order])
+    ax.set_xticklabels(order, rotation=25, ha="right", fontsize=8)
+    ax.set_ylabel("# high-risk counties")
+    ax.set_title(f"Dominant hazard among all-hazard top-10% ({b}h)")
+    for i, v in enumerate(vals):
+        ax.text(i, v + 0.5, str(v), ha="center", fontsize=8)
+
+
+def dominant_map(ax, b):
+    dom = dom_by_buf.get(b)
+    if dom is None:
+        ax.set_visible(False); return
+    dom = dom.copy(); dom["county_fips"] = dom["county_fips"].str.zfill(5)
+    present = [h for h in HAZ if (dom["dominant_hazard"] == h).any()]
+    cmap = ListedColormap([HCOLOR[h] for h in present])
+    geo = gdf.merge(dom, on="county_fips", how="left")
+    geo["code"] = pd.Categorical(geo["dominant_hazard"], categories=present).codes
+    geo.loc[geo["code"] < 0, "code"] = np.nan
+    geo.plot(column="code", cmap=cmap, vmin=0, vmax=max(1, len(present)-1),
+             linewidth=0.05, edgecolor="white", ax=ax, missing_kwds={"color": MISS})
+    ax.legend(handles=[Patch(color=HCOLOR[h], label=h) for h in present],
+              loc="lower right", fontsize=8)
+    ax.set_axis_off()
+    ax.set_title(f"Dominant hazard of high-risk counties ({b}h)")
+
+
+for b in risk_by_buf:
+    f, a = plt.subplots(figsize=(8, 5)); overlap_bars(a, b); f.tight_layout()
+    f.savefig(f"{FIG_DIR}/fig17_overlap_bars_{b}h.png", dpi=300); plt.close(f)
+    f, a = plt.subplots(figsize=(8, 5)); dominant_bar(a, b); f.tight_layout()
+    f.savefig(f"{FIG_DIR}/fig17_dominant_bar_{b}h.png", dpi=300); plt.close(f)
+    f, a = plt.subplots(figsize=(13, 8)); dominant_map(a, b); f.tight_layout()
+    f.savefig(f"{FIG_DIR}/fig17_dominant_map_{b}h.png", dpi=300); plt.close(f)
+
+    fig = plt.figure(figsize=(18, 14))
+    overlap_bars(fig.add_subplot(2, 2, 1), b)
+    dominant_bar(fig.add_subplot(2, 2, 2), b)
+    dominant_map(fig.add_subplot(2, 1, 2), b)
+    fig.suptitle(f"Section 17 — hazard-specific risk ({b}h buffer)", fontsize=15)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(f"{FIG_DIR}/fig17_combined_panel_{b}h.png", dpi=300); plt.close(fig)
+
+# 6h vs 12h comparison: per-hazard Spearman of R_haz across buffers
+if set(BUFFERS).issubset(risk_by_buf):
+    rows = []
+    from scipy.stats import spearmanr
+    for h in HAZ:
+        a = risk_by_buf[6][risk_by_buf[6]["hazard"] == h][["county_fips", "R_haz"]]
+        c = risk_by_buf[12][risk_by_buf[12]["hazard"] == h][["county_fips", "R_haz"]]
+        m = a.merge(c, on="county_fips", suffixes=("_6h", "_12h"))
+        if len(m) >= 5:
+            rho, _ = spearmanr(m["R_haz_6h"], m["R_haz_12h"])
+            rows.append((h, rho, len(m)))
+    if rows:
+        f, ax = plt.subplots(figsize=(8, 5))
+        hs = [r[0] for r in rows]; rhos = [r[1] for r in rows]
+        ax.bar(hs, rhos, color=[HCOLOR.get(h, "#888") for h in hs])
+        ax.set_ylim(0, 1.02); ax.set_ylabel("Spearman(R_haz 6h, R_haz 12h)")
+        ax.set_xticklabels(hs, rotation=25, ha="right", fontsize=8)
+        ax.set_title("Hazard risk: 6h vs 12h buffer agreement\nhigh = hazard attribution buffer-robust")
+        for i, (v, nn) in enumerate([(r[1], r[2]) for r in rows]):
+            ax.text(i, v + 0.01, f"{v:.3f}\n(n={nn})", ha="center", fontsize=7)
+        f.tight_layout()
+        f.savefig(f"{FIG_DIR}/fig17_buffer_compare.png", dpi=300); plt.close(f)
+        print("wrote fig17_buffer_compare.png")
+
+print(f"wrote Section 17 figures to {FIG_DIR} (fig17_*)")
