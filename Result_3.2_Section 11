@@ -1,0 +1,198 @@
+"""
+Section 11 — Attribution-buffer sensitivity experiment
+=======================================================
+Storm-outage linkage depends on the +/- temporal buffer, which is applied
+UPSTREAM in the Q1_3 linkage step (it determines which storm events attach to
+which outages). It CANNOT be re-derived from an already-built county_risk_input
+file. So this experiment needs one county_metric_comparison file PER BUFFER,
+each produced by re-running Q1_3 with that window:
+
+    6 h  -> narrow attribution
+    12 h -> main / default
+    24 h -> broad attribution
+
+Set BUFFER_INPUTS below to the actual re-run outputs. If a file is missing the
+script says so and skips that buffer instead of inventing numbers.
+
+For each buffer it rebuilds the baseline score:
+    E* = Pctl(storm_exposure_count)
+    B* = Pctl(customer_hours / customers_served)   [cap1 fixed: saturated=max]
+    D* = Pctl(p90_recovery_hr)
+    R_base = mean(E*, B*, D*)
+(optionally also a 3-dim LHS mean per buffer, controlled by DO_LHS)
+
+Then compares, on the counties common to both buffers:
+    spearman(R_12h, R_6h),  top-10% overlap
+    spearman(R_12h, R_24h), top-10% overlap
+
+Output (Q3_2):
+    risk_buffer_sensitivity.csv    Comparison | Spearman | top10_overlap | interpretation
+    risk_buffer_scores.csv         per-county R_base at each available buffer
+
+Reads:  one county_metric_comparison_*.csv per buffer + MCC.csv
+Requires: pandas, numpy, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+OUT_DIR = Q3_2
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---- POINT THESE AT THE PER-BUFFER Q1_3 RE-RUN OUTPUTS ----
+# The 12h file is the canonical one already used by the pipeline. The 6h and
+# 24h files must come from re-running Q1_3 with those windows. Edit paths/names
+# to match how the re-runs were saved.
+BUFFER_INPUTS = {
+    6:  f"{Q1_3}/county_metric_comparison_2015_2025_buffer6.csv",
+    12: f"{Q1_3}/county_metric_comparison_2015_2025.csv",          # default
+    24: f"{Q1_3}/county_metric_comparison_2015_2025_buffer24.csv",
+}
+
+TOP_FRAC = 0.10
+DO_LHS = True          # also compute a 3-dim LHS mean per buffer (feasible)
+K_LHS = 1000
+SEED = 42
+
+HIGH_RHO, HIGH_OVERLAP, MOD_RHO = 0.90, 0.80, 0.70
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def pctl(s):
+    return s.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+def build_scores(path, mcc_map):
+    """Rebuild E*, B*, D*, P*, R_base for one buffer file. Corrected cap."""
+    d = pd.read_csv(path, dtype={"county_fips": str})
+    d["county_fips"] = d["county_fips"].astype(str).str.zfill(5)
+
+    E = pd.to_numeric(d["storm_exposure_count"], errors="coerce").fillna(0)
+    ch = pd.to_numeric(d["total_customer_hours"], errors="coerce")
+    served = pd.to_numeric(d["county_fips"].map(mcc_map), errors="coerce")
+    served = served.where(served > 0, np.nan)
+    peak = pd.to_numeric(d["peak_customers_out_p90"], errors="coerce")
+    rec = pd.to_numeric(d["p90_recovery_hr"], errors="coerce")
+
+    flag = (served < peak).fillna(False)                 # out > served (limitation)
+    B = (ch / served).replace([np.inf, -np.inf], np.nan)
+    maxB = B[~flag].max()
+    B = B.where(~flag, maxB)                             # saturated -> max, not 1.0
+
+    out = pd.DataFrame({"county_fips": d["county_fips"]})
+    out["E_pct"] = pctl(E)
+    out["B_pct"] = pctl(B)
+    out.loc[flag.values, "B_pct"] = 100.0               # saturated at top
+    out["D_pct"] = pctl(rec)
+    out["P_pct"] = pctl(peak)
+    out["R_base"] = out[["E_pct", "B_pct", "D_pct"]].mean(axis=1)
+    return out
+
+
+def lhs_mean_3dim(scores_df, k=K_LHS, seed=SEED):
+    """Mean of the 3-dim weighted score across LHS-on-simplex weights."""
+    from scipy.stats.qmc import LatinHypercube
+    X = scores_df[["E_pct", "B_pct", "D_pct"]].to_numpy()
+    u = LatinHypercube(d=3, seed=seed).random(n=k)
+    e = -np.log(1.0 - u)
+    W = e / e.sum(axis=1, keepdims=True)
+    return (W @ X.T).mean(axis=0)                        # (n_counties,)
+
+
+def compare(ref, other, ref_col, oth_col):
+    """Spearman + top-10% overlap on the shared counties."""
+    m = ref[["county_fips", ref_col]].merge(
+        other[["county_fips", oth_col]], on="county_fips", how="inner")
+    rho, _ = spearmanr(m[ref_col], m[oth_col], nan_policy="omit")
+    k = int(np.ceil(TOP_FRAC * len(m)))
+    t_ref = set(m.nlargest(k, ref_col)["county_fips"])
+    t_oth = set(m.nlargest(k, oth_col)["county_fips"])
+    overlap = len(t_ref & t_oth) / k
+    return rho, overlap, len(m), k
+
+
+def interp(rho, overlap):
+    if rho >= HIGH_RHO and overlap >= HIGH_OVERLAP:
+        return "linkage robust to buffer choice"
+    if rho >= MOD_RHO:
+        return "some buffer sensitivity; hotspots partly shift"
+    return "strong buffer sensitivity; buffer choice materially changes ranking"
+
+
+# ---- load MCC + build per-buffer scores ----
+mcc_map = load_mcc(MCC_CSV)
+print(f"MCC counties: {len(mcc_map):,}")
+
+scores = {}
+for b, path in BUFFER_INPUTS.items():
+    if not os.path.exists(path):
+        print(f"  buffer {b}h: MISSING -> {path}\n"
+              f"           (re-run Q1_3 at {b}h to produce this file)")
+        continue
+    s = build_scores(path, mcc_map)
+    if DO_LHS:
+        s["R_lhs_mean"] = lhs_mean_3dim(s)
+    scores[b] = s
+    print(f"  buffer {b}h: {len(s):,} counties  (from {os.path.basename(path)})")
+
+if 12 not in scores:
+    raise SystemExit("\n12h (default) file is required as the reference; aborting.")
+
+# ---- comparisons: 12h vs 6h, 12h vs 24h ----
+rows = []
+for other_b in (6, 24):
+    if other_b not in scores:
+        rows.append({"Comparison": f"12h vs {other_b}h",
+                     "Spearman correlation": "n/a (file missing)",
+                     "top 10% overlap": "n/a", "interpretation": "buffer not run"})
+        continue
+    rho, ov, ncommon, k = compare(scores[12], scores[other_b], "R_base", "R_base")
+    rows.append({
+        "Comparison": f"12h vs {other_b}h",
+        "Spearman correlation": round(rho, 4),
+        "top 10% overlap": f"{ov*100:.1f}% ({int(round(ov*k))}/{k})",
+        "interpretation": interp(rho, ov),
+    })
+    print(f"\n12h vs {other_b}h (baseline, n={ncommon:,}):")
+    print(f"  Spearman = {rho:.4f} | top-10% overlap = {ov*100:.1f}%")
+    if DO_LHS:
+        rhoL, ovL, _, _ = compare(scores[12], scores[other_b],
+                                  "R_lhs_mean", "R_lhs_mean")
+        print(f"  [LHS mean] Spearman = {rhoL:.4f} | overlap = {ovL*100:.1f}%")
+
+summary = pd.DataFrame(rows)
+summary.to_csv(f"{OUT_DIR}/risk_buffer_sensitivity.csv", index=False)
+print("\nBuffer-sensitivity summary:")
+print(summary.to_string(index=False))
+
+# ---- per-county R_base across buffers ----
+per_county = None
+for b in sorted(scores):
+    col = scores[b][["county_fips", "R_base"]].rename(
+        columns={"R_base": f"R_base_{b}h"})
+    per_county = col if per_county is None else per_county.merge(
+        col, on="county_fips", how="outer")
+per_county.to_csv(f"{OUT_DIR}/risk_buffer_scores.csv", index=False)
+
+print(f"\nWrote:\n  {OUT_DIR}/risk_buffer_sensitivity.csv")
+print(f"  {OUT_DIR}/risk_buffer_scores.csv  ({len(per_county):,} counties)")
+if not DO_LHS:
+    print("\n(LHS mean skipped; set DO_LHS=True to include it.)")
