@@ -1,0 +1,238 @@
+"""
+Section 16 — Temporal robustness experiment
+============================================
+Tests whether the risk picture is driven by one extreme year (e.g. a big
+hurricane season).
+
+16.1 Year-wise risk
+     For each year y:  R_{c,y} = (E*_{c,y} + B*_{c,y} + D*_{c,y}) / 3
+     (percentiles computed WITHIN that year). Then per county:
+       - top10_appearances : # years the county is in that year's top 10%
+       - mean_annual_risk  : mean of R_{c,y} over years present
+       - years_high_risk   : # years the county's annual class is high+ (pct >= 75)
+
+16.2 Leave-one-year-out risk
+     For each year y, drop it and recompute the full-period score R_{-y};
+     compare with the full score R_full via Spearman + top-10% overlap.
+     A year whose removal sharply drops Spearman is a dominant year.
+
+     ADDITIVITY NOTE: exposure count and customer-hours are additive across
+     years, so their leave-one-out is exact. P90 recovery is a percentile and
+     is NOT additive; a fully exact LOO recovery needs event-level durations
+     re-aggregated without year y. Here recovery is approximated by an
+     exposure-count-weighted mean of the remaining years' P90, applied the SAME
+     way to R_full and R_{-y} so the comparison stays internally consistent.
+     The recovery term is therefore approximate; exposure and burden are exact.
+
+Outputs (Q3_2):
+    risk_temporal_robustness.csv   16.2 leave-one-out table (year, Spearman,
+                                   top-10 overlap, interpretation)
+    risk_temporal_county.csv       16.1 per-county metrics
+    figures/fig_loo_spearman_by_year.png
+
+Reads:  county_metric_comparison_yearly_2015_2025.csv   (per-year raw metrics)
+        county_risk_input.csv   (county universe, customers_served, peak)
+        MCC.csv
+Requires: pandas, numpy, matplotlib, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+OUT_DIR = Q3_2
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+YEARLY_CSV = f"{Q1_3}/county_metric_comparison_yearly_2015_2025.csv"
+TOP_FRAC = 0.10
+HIGH_PCT = 75.0        # "high-risk" year = annual risk percentile >= 75 (high+)
+
+
+def find_input(fname):
+    for base_dir in (Q3_2, Q3):
+        p = f"{base_dir}/{fname}"
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def pctl(s):
+    return s.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+# ---- load ----
+yearly = pd.read_csv(YEARLY_CSV, dtype={"county_fips": str, "period": str})
+yearly["county_fips"] = yearly["county_fips"].str.zfill(5)
+yearly["year"] = pd.to_numeric(yearly["period"], errors="coerce")
+yearly = yearly[yearly["year"].notna()].copy()
+yearly["year"] = yearly["year"].astype(int)
+for c in ["storm_exposure_count", "total_customer_hours",
+          "peak_customers_out_p90", "p90_recovery_hr"]:
+    yearly[c] = pd.to_numeric(yearly[c], errors="coerce").fillna(0)
+
+mcc_map = load_mcc(MCC_CSV)
+
+inp_path = find_input("county_risk_input.csv")
+if inp_path is None:
+    raise FileNotFoundError("county_risk_input.csv not found in Q3_2 or Q3")
+inp = pd.read_csv(inp_path, dtype={"county_fips": str})
+inp["county_fips"] = inp["county_fips"].str.zfill(5)
+universe = inp[["county_fips"]].drop_duplicates().reset_index(drop=True)
+served = universe["county_fips"].map(mcc_map).astype(float)
+served = served.where(served > 0, np.nan)
+pooled_peak = universe["county_fips"].map(
+    dict(zip(inp["county_fips"], pd.to_numeric(inp["p90_peak_outage"],
+                                               errors="coerce")))).astype(float)
+flag_full = (served < pooled_peak).fillna(False).to_numpy()
+served_arr = served.to_numpy()
+years = sorted(yearly["year"].unique())
+print(f"counties (universe): {len(universe):,} | years: {years[0]}-{years[-1]} "
+      f"({len(years)})")
+
+
+def score_from_aggregates(E, CH, D):
+    """Aggregate E, customer-hours, recovery -> R (mean of three percentiles),
+    corrected burden cap."""
+    B = np.divide(CH, served_arr, out=np.full_like(CH, np.nan, dtype=float),
+                  where=~np.isnan(served_arr) & (served_arr > 0))
+    good = B[~flag_full & ~np.isnan(B)]
+    maxB = np.nanmax(good) if good.size else np.nan
+    B = np.where(flag_full, maxB, B)
+    Bp = pctl(pd.Series(B))
+    Bp[flag_full] = 100.0
+    Ep = pctl(pd.Series(E))
+    Dp = pctl(pd.Series(D))
+    return np.vstack([Ep.to_numpy(), Bp.to_numpy(), Dp.to_numpy()]).mean(axis=0)
+
+
+def aggregate_over_years(year_set):
+    """Sum E and CH over year_set (exact); recovery = exposure-weighted mean of
+    yearly P90 (approximation). Aligned to the county universe."""
+    sub = yearly[yearly["year"].isin(year_set)]
+    gE = sub.groupby("county_fips")["storm_exposure_count"].sum()
+    gCH = sub.groupby("county_fips")["total_customer_hours"].sum()
+    w = sub["storm_exposure_count"]
+    sub_wd = (w * sub["p90_recovery_hr"]).groupby(sub["county_fips"]).sum()
+    sub_w = w.groupby(sub["county_fips"]).sum()
+    gD = sub_wd / sub_w.replace(0, np.nan)
+    idx = universe["county_fips"]
+    E = gE.reindex(idx).fillna(0).to_numpy()
+    CH = gCH.reindex(idx).fillna(0).to_numpy()
+    D = gD.reindex(idx).fillna(0).to_numpy()
+    return E, CH, D
+
+
+# ============================================================
+# 16.1 Year-wise risk
+# ============================================================
+print("\n16.1 year-wise risk ...")
+annual = universe.copy()
+appear = np.zeros(len(universe))
+highyrs = np.zeros(len(universe))
+rsum = np.zeros(len(universe))
+
+for y in years:
+    E, CH, D = aggregate_over_years([y])
+    R = score_from_aggregates(E, CH, D)
+    Rp = pctl(pd.Series(R)).to_numpy()
+    k = int(np.ceil(TOP_FRAC * len(R)))
+    top_idx = set(np.argsort(-R)[:k].tolist())
+    is_top = np.array([i in top_idx for i in range(len(R))])
+    appear += is_top
+    highyrs += (Rp >= HIGH_PCT)
+    rsum += R
+
+annual["top10_appearances"] = appear.astype(int)
+annual["mean_annual_risk"] = rsum / len(years)
+annual["years_high_risk"] = highyrs.astype(int)
+annual["n_years"] = int(len(years))
+annual = annual.merge(inp[["county_fips", "county_name", "state"]].drop_duplicates(),
+                      on="county_fips", how="left")
+annual = annual.sort_values("top10_appearances", ascending=False).reset_index(drop=True)
+annual.to_csv(f"{OUT_DIR}/risk_temporal_county.csv", index=False)
+print(f"  wrote {OUT_DIR}/risk_temporal_county.csv")
+print("  counties in annual top-10% in >= half the years: "
+      f"{(annual['top10_appearances'] >= len(years)/2).sum():,}")
+
+# ============================================================
+# 16.2 Leave-one-year-out
+# ============================================================
+print("\n16.2 leave-one-year-out ...")
+E_f, CH_f, D_f = aggregate_over_years(years)
+R_full = score_from_aggregates(E_f, CH_f, D_f)
+k = int(np.ceil(TOP_FRAC * len(R_full)))
+T_full = set(np.argsort(-R_full)[:k].tolist())
+
+rows = []
+for y in years:
+    keep = [yy for yy in years if yy != y]
+    E, CH, D = aggregate_over_years(keep)
+    R_minus = score_from_aggregates(E, CH, D)
+    rho, _ = spearmanr(R_full, R_minus)
+    T_minus = set(np.argsort(-R_minus)[:k].tolist())
+    overlap = len(T_full & T_minus) / k
+    rows.append({"removed_year": y,
+                 "spearman_full_vs_minus": round(rho, 4),
+                 "top10_overlap_pct": round(overlap * 100, 1),
+                 "top10_overlap": f"{len(T_full & T_minus)}/{k}"})
+    print(f"  drop {y}: rho={rho:.4f}, top-10 overlap={overlap*100:.1f}%")
+
+loo = pd.DataFrame(rows)
+minrho = loo["spearman_full_vs_minus"].min()
+dom_year = int(loo.loc[loo["spearman_full_vs_minus"].idxmin(), "removed_year"])
+loo["interpretation"] = np.where(
+    loo["spearman_full_vs_minus"] == minrho,
+    f"largest impact: removing {dom_year} most changes the ranking",
+    "removal leaves ranking largely intact")
+loo.to_csv(f"{OUT_DIR}/risk_temporal_robustness.csv", index=False)
+print(f"\n  min Spearman = {minrho:.4f} when removing {dom_year} "
+      f"(most influential year)")
+print(f"  wrote {OUT_DIR}/risk_temporal_robustness.csv")
+
+# ---- figure ----
+fig, ax = plt.subplots(figsize=(10, 5))
+bars = ax.bar(loo["removed_year"].astype(str), loo["spearman_full_vs_minus"],
+              color="#4575b4", edgecolor="white")
+ax.bar(str(dom_year),
+       loo.loc[loo["removed_year"] == dom_year, "spearman_full_vs_minus"].iloc[0],
+       color="#d73027", edgecolor="white")
+ax.set_ylim(min(0.8, minrho - 0.02), 1.001)
+ax.axhline(1.0, color="gray", ls=":", lw=1)
+ax.set_ylabel("Spearman(R_full, R_minus_year)")
+ax.set_xlabel("year removed")
+ax.set_title("Leave-one-year-out temporal robustness\n"
+             "Lower bar = removing that year changes the ranking more "
+             "(red = most influential)")
+for b, v in zip(bars, loo["spearman_full_vs_minus"]):
+    ax.text(b.get_x() + b.get_width()/2, v + 0.001, f"{v:.3f}",
+            ha="center", va="bottom", fontsize=7)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_loo_spearman_by_year.png", dpi=300)
+plt.close(fig)
+print(f"  wrote {FIG_DIR}/fig_loo_spearman_by_year.png")
+
+print("\nNote: recovery term in 16.2 is an exposure-weighted P90 approximation "
+      "(P90 is non-additive). Exposure and burden leave-one-out are exact.")
