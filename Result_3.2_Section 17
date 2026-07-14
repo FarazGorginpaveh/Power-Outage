@@ -1,0 +1,333 @@
+"""
+Section 17 — Hazard-specific risk  (built from event-level linkage; 6h & 12h)
+=============================================================================
+No pre-aggregated by-hazard file exists, so this builds the hazard split from
+the raw event tables:
+
+  storm_linked_outage_events_2015_2025.csv : outage events with auc
+      (customer-hours), recovery_hr, peak_customers_out, peak_time, and the
+      linkage flags storm_linked_6h / storm_linked_12h.
+  county_level_storm_records_2015_2025.csv : storm events with event_type
+      (the hazard) and start_time/end_time.
+
+For each buffer b in {6, 12}:
+  1. Take outages with storm_linked_{b}h == True.
+  2. PRIMARY-HAZARD attribution: assign each such outage to the single storm in
+     the SAME county whose time window is nearest the outage peak_time and
+     within +/- b hours. That storm's event_type -> grouped hazard.
+     (Nearest-storm rule avoids double-counting when an outage links to several
+      storms; per-hazard burdens stay disjoint.)
+  3. Aggregate by (county, hazard):
+       B_{c,h} : sum(auc) / customers_served         [cap1 corrected: sat=max]
+       D_{c,h} : P90(recovery_hr)
+     Exposure E_{c,h} : count of storm RECORDS of hazard h in county c.
+  4. R_{c,h} = mean(E*_{c,h}, B*_{c,h}, D*_{c,h}), percentiles WITHIN the hazard,
+     over counties with E_{c,h} > 0. Sample-size gating -> main / exploratory.
+
+Outputs per buffer (Q3_2), suffixed _<b>h:
+    county_hazard_specific_risk_<b>h.csv
+    hazard_risk_overlap_<b>h.csv
+    hazard_dominant_among_highrisk_<b>h.csv
+    figures/fig_hazard_risk_<hazard>_<b>h.png
+
+assumptions (change at top if wrong):
+    auc is already customer-hours (not intervals)
+    all-hazard reference R_base comes from county_risk_input.csv
+Requires: pandas, numpy, matplotlib, geopandas, scipy
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from scipy.stats import spearmanr
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3"
+Q1_3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q1_3"
+MCC_CSV = f"{BASE}/Power_Outage_ZeroFill/MCC.csv"
+Q3 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3"
+Q3_2 = f"{BASE}/Power_Outage_ZeroFill/Results/Q3_2"
+OUT_DIR = Q3_2
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+LINKED_CSV = f"{Q1_3}/storm_linked_outage_events_2015_2025.csv"
+STORM_CSV = f"{Q1_3}/county_level_storm_records_2015_2025.csv"
+SHP_PATH = f"{BASE}/Power_Outage_ZeroFill/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS_PREFIXES = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#bdbdbd"
+DPI = 300
+
+BUFFERS = [6, 12]
+TOP_FRAC = 0.10
+MIN_COUNTIES = 50
+MAKE_MAPS = True
+
+STORM_MAP = {
+    "Thunderstorm Wind": "Thunderstorm Wind", "Lightning": "Thunderstorm Wind",
+    "Hail": "Thunderstorm Wind",
+    "Hurricane": "Tropical Cyclone", "Hurricane (Typhoon)": "Tropical Cyclone",
+    "Tropical Storm": "Tropical Cyclone", "Tropical Depression": "Tropical Cyclone",
+    "Storm Surge/Tide": "Tropical Cyclone",
+    "Flood": "Flood", "Flash Flood": "Flood", "Coastal Flood": "Flood",
+    "Heavy Rain": "Flood", "Excessive Rainfall": "Flood",
+    "Tornado": "Tornado", "Funnel Cloud": "Tornado", "Waterspout": "Tornado",
+    "Winter Storm": "Winter Storm", "Winter Weather": "Winter Storm",
+    "Blizzard": "Winter Storm", "Ice Storm": "Winter Storm",
+    "Heavy Snow": "Winter Storm", "Sleet": "Winter Storm",
+    "Lake-Effect Snow": "Winter Storm",
+}
+TARGET_HAZARDS = ["Thunderstorm Wind", "Tropical Cyclone", "Flood",
+                  "Tornado", "Winter Storm"]
+
+
+def find_input(fname):
+    for base_dir in (Q3_2, Q3):
+        p = f"{base_dir}/{fname}"
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_mcc(path):
+    m = pd.read_csv(path)
+    m.columns = [c.strip() for c in m.columns]
+    fcol = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    ccol = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[ccol] = pd.to_numeric(m[ccol], errors="coerce")
+    fnum = pd.to_numeric(m[fcol], errors="coerce")
+    m = m[fnum.notna() & m[ccol].notna()].copy()
+    m[fcol] = fnum[fnum.notna()].astype("int64").astype(str).str.zfill(5)
+    return dict(zip(m[fcol], m[ccol]))
+
+
+def pctl(s):
+    return s.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+def truthy(series):
+    return series.astype(str).str.lower().isin(["true", "1", "1.0", "yes", "t"])
+
+
+# ============================================================
+# load event tables once
+# ============================================================
+print("Loading event tables ...")
+mcc_map = load_mcc(MCC_CSV)
+
+storms = pd.read_csv(STORM_CSV, dtype={"county_fips": str})
+storms["county_fips"] = storms["county_fips"].str.zfill(5)
+storms["hazard"] = storms["event_type"].map(STORM_MAP).fillna("Other")
+storms["s_start"] = pd.to_datetime(storms["start_time"], errors="coerce")
+storms["s_end"] = pd.to_datetime(storms["end_time"], errors="coerce")
+storms = storms.dropna(subset=["s_start", "s_end"])
+print(f"  storm records: {len(storms):,}")
+
+# E_{c,h}: storm-record count by (county, hazard)  -- exposure per hazard
+E_ch = (storms.groupby(["county_fips", "hazard"]).size()
+        .rename("E").reset_index())
+
+outs = pd.read_csv(LINKED_CSV, dtype={"county_fips": str})
+outs["county_fips"] = outs["county_fips"].str.zfill(5)
+outs["auc"] = pd.to_numeric(outs["auc"], errors="coerce")
+outs["recovery_hr"] = pd.to_numeric(outs["recovery_hr"], errors="coerce")
+outs["peak_customers_out"] = pd.to_numeric(outs["peak_customers_out"], errors="coerce")
+outs["peak_dt"] = pd.to_datetime(outs["peak_time"], errors="coerce")
+outs["peak_dt"] = outs["peak_dt"].fillna(pd.to_datetime(outs["event_start"],
+                                                         errors="coerce"))
+outs = outs.dropna(subset=["peak_dt"])
+print(f"  outage events: {len(outs):,}")
+
+# all-hazard reference
+# all-hazard reference R_base: prefer county_risk_baseline.csv (has R_base);
+# otherwise derive it from county_risk_input.csv percentiles.
+base_path = find_input("county_risk_baseline.csv")
+if base_path is not None:
+    allh = pd.read_csv(base_path, dtype={"county_fips": str})
+    allh["county_fips"] = allh["county_fips"].str.zfill(5)
+    if "R_base" not in allh.columns:
+        allh["R_base"] = allh[["E_pct", "B_pct", "D_pct"]].apply(
+            pd.to_numeric, errors="coerce").mean(axis=1)
+    print(f"  all-hazard reference: {base_path}")
+else:
+    inp_path = find_input("county_risk_input.csv")
+    if inp_path is None:
+        raise SystemExit("neither county_risk_baseline.csv nor "
+                         "county_risk_input.csv found (needed for all-hazard R)")
+    allh = pd.read_csv(inp_path, dtype={"county_fips": str})
+    allh["county_fips"] = allh["county_fips"].str.zfill(5)
+    allh["R_base"] = allh[["E_pct", "B_pct", "D_pct"]].apply(
+        pd.to_numeric, errors="coerce").mean(axis=1)
+    print(f"  all-hazard reference: derived R_base from {inp_path}")
+
+allh_R = dict(zip(allh["county_fips"], pd.to_numeric(allh["R_base"], errors="coerce")))
+names = allh[["county_fips", "county_name", "state"]].drop_duplicates()
+
+# storms grouped by county for fast lookup
+storms_by_c = {c: g for c, g in storms.groupby("county_fips")}
+
+
+def attribute_primary_hazard(o_df, buffer_hr):
+    """For each outage row, nearest storm (same county) within +/- buffer of
+    peak_dt -> that storm's hazard. Chunked to bound memory."""
+    buf = np.timedelta64(buffer_hr, "h")
+    haz_out = np.array([None] * len(o_df), dtype=object)
+    pos = {ix: i for i, ix in enumerate(o_df.index)}
+    for c, og in o_df.groupby("county_fips"):
+        sg = storms_by_c.get(c)
+        if sg is None or len(sg) == 0:
+            continue
+        s_start = sg["s_start"].values.astype("datetime64[ns]")
+        s_end = sg["s_end"].values.astype("datetime64[ns]")
+        s_haz = sg["hazard"].values
+        Ns = len(sg)
+        peaks = og["peak_dt"].values.astype("datetime64[ns]")
+        idx_local = [pos[ix] for ix in og.index]
+        chunk = max(1, min(4000, int(2_000_000 / max(1, Ns))))
+        for i in range(0, len(peaks), chunk):
+            P = peaks[i:i + chunk][:, None]              # (c,1)
+            before = s_start[None, :] - P                # storm after peak
+            after = P - s_end[None, :]                   # storm before peak
+            zero = np.timedelta64(0, "ns")
+            dist = np.maximum(np.maximum(before, after), zero)   # (c,Ns)
+            within = dist <= buf
+            distf = dist.astype("timedelta64[s]").astype(np.float64)
+            distf[~within] = np.inf
+            jmin = distf.argmin(axis=1)
+            anyw = within.any(axis=1)
+            sel = s_haz[jmin]
+            sel = np.where(anyw, sel, None)
+            for r, val in enumerate(sel):
+                haz_out[idx_local[i + r]] = val
+    return pd.Series(haz_out, index=o_df.index)
+
+
+def build_for_buffer(buffer_hr):
+    print(f"\n=== buffer {buffer_hr}h ===")
+    linked_col = f"storm_linked_{buffer_hr}h"
+    o = outs[truthy(outs[linked_col])].copy()
+    print(f"  linked outages: {len(o):,}")
+    o["hazard"] = attribute_primary_hazard(o, buffer_hr)
+    matched = o["hazard"].notna().sum()
+    print(f"  matched to a hazard: {matched:,} "
+          f"({matched/max(1,len(o))*100:.1f}%)")
+    o = o[o["hazard"].isin(TARGET_HAZARDS)]
+
+    agg = o.groupby(["county_fips", "hazard"]).agg(
+        CH=("auc", "sum"),
+        D=("recovery_hr", lambda s: np.nanpercentile(s, 90) if s.notna().any() else 0.0),
+        peak=("peak_customers_out", "max"),
+        n_outages=("event_id", "count")).reset_index()
+
+    df = E_ch[E_ch["hazard"].isin(TARGET_HAZARDS)].merge(
+        agg, on=["county_fips", "hazard"], how="left")
+    df[["CH", "D", "peak", "n_outages"]] = df[["CH", "D", "peak", "n_outages"]].fillna(0)
+
+    records, overlap_rows, haz_R_maps = [], [], {}
+    k_all = int(np.ceil(TOP_FRAC * len(allh)))
+    T_all = set(allh.nlargest(k_all, "R_base")["county_fips"])
+
+    for h in TARGET_HAZARDS:
+        g = df[df["hazard"] == h].copy()
+        g = g[g["E"] > 0]
+        n_active = len(g)
+        if n_active == 0:
+            print(f"  {h}: no exposure -> skipped")
+            continue
+        status = "main" if n_active >= MIN_COUNTIES else "exploratory"
+        served = g["county_fips"].map(mcc_map).astype(float)
+        served = served.where(served > 0, np.nan)
+        flag = (served < g["peak"]).fillna(False)
+        B = (g["CH"] / served).replace([np.inf, -np.inf], np.nan)
+        maxB = B[~flag].max()
+        B = B.where(~flag, maxB)
+        g["E_star"] = pctl(g["E"])
+        g["B_star"] = pctl(B)
+        g.loc[flag.values, "B_star"] = 100.0
+        g["D_star"] = pctl(g["D"])
+        g["R_haz"] = g[["E_star", "B_star", "D_star"]].mean(axis=1)
+        g["sample_status"] = status
+        g["n_active_counties"] = n_active
+        records.append(g)
+        haz_R_maps[h] = dict(zip(g["county_fips"], g["R_haz"]))
+        print(f"  {h}: {n_active:,} active counties -> {status}")
+
+        g2 = g.copy()
+        g2["R_all"] = g2["county_fips"].map(allh_R)
+        g2 = g2.dropna(subset=["R_all"])
+        rho, _ = spearmanr(g2["R_haz"], g2["R_all"], nan_policy="omit")
+        kh = int(np.ceil(TOP_FRAC * len(g2)))
+        T_haz = set(g2.nlargest(kh, "R_haz")["county_fips"]) if kh else set()
+        overlap = len(T_haz & T_all) / kh if kh else np.nan
+        overlap_rows.append({"hazard": h, "sample_status": status,
+                             "n_active_counties": n_active,
+                             "spearman_vs_allhazard": round(rho, 4),
+                             "top10_overlap_vs_allhazard_pct": round(overlap*100, 1)})
+
+    if not records:
+        print("  no usable hazards for this buffer")
+        return
+
+    out = pd.concat(records, ignore_index=True).merge(names, on="county_fips",
+                                                      how="left")
+    out = out[["county_fips", "county_name", "state", "hazard", "sample_status",
+               "n_active_counties", "E", "CH", "D", "n_outages",
+               "E_star", "B_star", "D_star", "R_haz"]]
+    out = out.sort_values(["hazard", "R_haz"], ascending=[True, False])
+    out.to_csv(f"{OUT_DIR}/county_hazard_specific_risk_{buffer_hr}h.csv", index=False)
+
+    ov = pd.DataFrame(overlap_rows)
+    ov.to_csv(f"{OUT_DIR}/hazard_risk_overlap_{buffer_hr}h.csv", index=False)
+    print(f"\n  overlap vs all-hazard ({buffer_hr}h):")
+    print(ov.to_string(index=False))
+
+    dom_rows = []
+    for fips in T_all:
+        best_h, best_r = None, -np.inf
+        for h, mp in haz_R_maps.items():
+            if fips in mp and mp[fips] > best_r:
+                best_h, best_r = h, mp[fips]
+        dom_rows.append({"county_fips": fips, "dominant_hazard": best_h,
+                         "dominant_R": None if best_h is None else round(best_r, 1)})
+    dom = pd.DataFrame(dom_rows).merge(names, on="county_fips", how="left")
+    dom.to_csv(f"{OUT_DIR}/hazard_dominant_among_highrisk_{buffer_hr}h.csv",
+               index=False)
+    dom_tab = (dom["dominant_hazard"].value_counts(dropna=False)
+               .rename("n").to_frame())
+    dom_tab["pct"] = (dom_tab["n"] / len(dom) * 100).round(1)
+    print(f"\n  dominant hazard among {len(T_all):,} all-hazard top-10% counties:")
+    print(dom_tab.to_string())
+
+    if MAKE_MAPS:
+        gdf = gpd.read_file(SHP_PATH)
+        gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+        gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS_PREFIXES)].copy()
+        gdf = gdf.to_crs("EPSG:5070")
+        for h in [x for x in TARGET_HAZARDS if x in haz_R_maps]:
+            sub = out[out["hazard"] == h][["county_fips", "R_haz", "sample_status"]]
+            geo = gdf.merge(sub, on="county_fips", how="left")
+            fig, ax = plt.subplots(figsize=(13, 8))
+            geo.plot(column="R_haz", cmap="inferno_r", vmin=0, vmax=100,
+                     linewidth=0.05, edgecolor="white", legend=True, ax=ax,
+                     missing_kwds={"color": MISSING_COLOR, "label": "no exposure"},
+                     legend_kwds={"shrink": 0.6, "label": f"{h} risk (0-100)"})
+            ax.set_axis_off()
+            tag = "" if sub["sample_status"].iloc[0] == "main" \
+                else "  [EXPLORATORY: low sample]"
+            ax.set_title(f"Hazard-specific risk — {h} ({buffer_hr}h buffer){tag}",
+                         fontsize=12, pad=10)
+            fig.tight_layout()
+            safe = h.replace(" ", "_")
+            fig.savefig(f"{FIG_DIR}/fig_hazard_risk_{safe}_{buffer_hr}h.png", dpi=DPI)
+            plt.close(fig)
+        print(f"  maps -> {FIG_DIR}/fig_hazard_risk_<hazard>_{buffer_hr}h.png")
+
+
+for b in BUFFERS:
+    build_for_buffer(b)
+
+print(f"\nAll Section 17 outputs (6h & 12h) in: {OUT_DIR}")
