@@ -1,0 +1,177 @@
+"""
+Bivariate quartile maps (pooled 2015-2025)
+===========================================
+Two 4x4 bivariate choropleths (each variable cut into quartiles Q1-Q4):
+
+  Map 1: number of storm exposures  vs  number of outage events
+           x = n_storms            (storm records per county)
+           y = n_outage_events     (outage events per county)
+
+  Map 2: storm duration            vs  power-outage duration
+           x = storm_hours         (sum of storm end-start, hours)
+           y = outage_hours        (sum of recovery_hr, hours)   [see DURATION_MODE]
+
+Bivariate colour scheme: a 3x3-style blend on a 4x4 grid — low-low = pale,
+high-x = one hue, high-y = another hue, high-high = dark blend. A 4x4 legend
+key is drawn beside each map.
+
+Quartiles are computed over counties with a non-missing value (empty counties
+shown grey). Cut with rank so the four classes are ~equal-sized.
+
+Reads:  county_level_storm_records_2015_2025.csv, outage_event_table_2015_2025.csv
+        shapefile cb_2022_us_county_5m.shp
+Writes: Results/Start_From_Begining/figures/
+          fig_bivariate_storms_vs_outages.png
+          fig_bivariate_stormdur_vs_outagedur.png
+        Results/Start_From_Begining/bivariate_quartile_values.csv
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3/Power_Outage_ZeroFill"
+Q1_3 = f"{BASE}/Results/Q1_3"
+OUT_DIR = f"{BASE}/Results/Start_From_Begining"
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+STORM_CSV = f"{Q1_3}/county_level_storm_records_2015_2025.csv"
+OUTAGE_CSV = f"{Q1_3}/outage_event_table_2015_2025.csv"
+SHP = f"{BASE}/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#e6e6e6"
+
+DURATION_MODE = "total"     # outage duration: "total" (sum recovery_hr) or "p90"
+
+# 4x4 bivariate palette: corners defined, grid bilinearly interpolated.
+# low-low pale grey; high-x = teal; high-y = magenta/purple; high-high = dark.
+C00 = to_rgb("#e8e8e8")   # low x, low y
+Cx0 = to_rgb("#5ac8c8")   # high x, low y  (more storms/duration)
+C0y = to_rgb("#be64ac")   # low x, high y  (more outages/duration)
+Cxy = to_rgb("#3b4994")   # high x, high y
+
+
+def bivariate_color(ix, iy, n=4):
+    """ix, iy in 0..n-1 -> blended RGB."""
+    fx = ix / (n - 1)
+    fy = iy / (n - 1)
+    bottom = [(1 - fx) * C00[k] + fx * Cx0[k] for k in range(3)]
+    top = [(1 - fx) * C0y[k] + fx * Cxy[k] for k in range(3)]
+    return tuple((1 - fy) * bottom[k] + fy * top[k] for k in range(3))
+
+
+PALETTE = {(ix, iy): bivariate_color(ix, iy) for ix in range(4) for iy in range(4)}
+
+
+def quartile(series):
+    """Rank into 0..3 (Q1..Q4); NaN stays NaN."""
+    r = series.rank(method="average", pct=True)
+    q = np.ceil(r * 4).clip(1, 4) - 1        # 0..3
+    return q.where(series.notna(), np.nan)
+
+
+def build_metrics():
+    st = pd.read_csv(STORM_CSV, dtype={"county_fips": str})
+    st["county_fips"] = st["county_fips"].str.zfill(5)
+    st["s_start"] = pd.to_datetime(st["start_time"], errors="coerce")
+    st["s_end"] = pd.to_datetime(st["end_time"], errors="coerce")
+    st["dur_hr"] = ((st["s_end"] - st["s_start"]).dt.total_seconds() / 3600.0).clip(lower=0)
+    sg = st.groupby("county_fips").agg(
+        n_storms=("event_type", "size"),
+        storm_hours=("dur_hr", "sum")).reset_index()
+
+    ot = pd.read_csv(OUTAGE_CSV, dtype={"county_fips": str})
+    ot["county_fips"] = ot["county_fips"].str.zfill(5)
+    ot["recovery_hr"] = pd.to_numeric(ot["recovery_hr"], errors="coerce")
+    if DURATION_MODE == "p90":
+        od = ot.groupby("county_fips")["recovery_hr"].agg(
+            lambda s: np.percentile(s.dropna(), 90) if s.notna().any() else np.nan)
+        odur = od.rename("outage_hours").reset_index()
+    else:
+        odur = ot.groupby("county_fips")["recovery_hr"].sum().rename(
+            "outage_hours").reset_index()
+    og = ot.groupby("county_fips").size().rename("n_outage_events").reset_index()
+
+    df = sg.merge(og, on="county_fips", how="outer").merge(
+        odur, on="county_fips", how="outer")
+    return df
+
+
+def draw_bivariate(df, xcol, ycol, xlabel, ylabel, title, fname):
+    d = df.copy()
+    d["qx"] = quartile(d[xcol])
+    d["qy"] = quartile(d[ycol])
+    d["bi"] = d.apply(
+        lambda r: f"{int(r['qx'])}{int(r['qy'])}"
+        if pd.notna(r["qx"]) and pd.notna(r["qy"]) else np.nan, axis=1)
+
+    gdf = gpd.read_file(SHP)
+    gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+    gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS)].to_crs("EPSG:5070")
+    geo = gdf.merge(d, on="county_fips", how="left")
+
+    fig = plt.figure(figsize=(15, 9))
+    ax = fig.add_axes([0.02, 0.05, 0.72, 0.9])
+    # plot each bivariate class
+    for ix in range(4):
+        for iy in range(4):
+            key = f"{ix}{iy}"
+            sub = geo[geo["bi"] == key]
+            if len(sub):
+                sub.plot(ax=ax, color=PALETTE[(ix, iy)], linewidth=0.05,
+                         edgecolor="white")
+    geo[geo["bi"].isna()].plot(ax=ax, color=MISSING_COLOR, linewidth=0.05,
+                               edgecolor="white")
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=14, pad=8)
+
+    # legend key (4x4)
+    lax = fig.add_axes([0.78, 0.30, 0.18, 0.4])
+    for ix in range(4):
+        for iy in range(4):
+            lax.add_patch(plt.Rectangle((ix, iy), 1, 1,
+                          color=PALETTE[(ix, iy)]))
+    lax.set_xlim(0, 4); lax.set_ylim(0, 4)
+    lax.set_xticks([0.5, 1.5, 2.5, 3.5]); lax.set_yticks([0.5, 1.5, 2.5, 3.5])
+    lax.set_xticklabels(["Q1", "Q2", "Q3", "Q4"], fontsize=8)
+    lax.set_yticklabels(["Q1", "Q2", "Q3", "Q4"], fontsize=8)
+    lax.set_xlabel(f"{xlabel} →", fontsize=9)
+    lax.set_ylabel(f"{ylabel} →", fontsize=9)
+    lax.set_aspect("equal")
+    lax.set_title("higher = darker\n(Q4 = top quartile)", fontsize=8)
+
+    fig.savefig(fname, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return d[["county_fips", xcol, ycol, "qx", "qy", "bi"]]
+
+
+df = build_metrics()
+
+r1 = draw_bivariate(
+    df, "n_storms", "n_outage_events",
+    "Number of storms", "Number of outages",
+    "Storm exposure vs number of outage events (quartiles, 2015-2025)",
+    f"{FIG_DIR}/fig_bivariate_storms_vs_outages.png")
+
+r2 = draw_bivariate(
+    df, "storm_hours", "outage_hours",
+    "Storm duration", "Outage duration",
+    f"Storm duration vs outage duration (quartiles, 2015-2025)"
+    f"  [outage = {DURATION_MODE} recovery_hr]",
+    f"{FIG_DIR}/fig_bivariate_stormdur_vs_outagedur.png")
+
+df.to_csv(f"{OUT_DIR}/bivariate_quartile_values.csv", index=False)
+print("counties:", len(df))
+print("Map 1 class counts (n_storms x n_outage_events):")
+print(r1["bi"].value_counts().sort_index().to_string())
+print("\nMap 2 class counts (storm_hours x outage_hours):")
+print(r2["bi"].value_counts().sort_index().to_string())
+print(f"\nWrote:\n  {FIG_DIR}/fig_bivariate_storms_vs_outages.png")
+print(f"  {FIG_DIR}/fig_bivariate_stormdur_vs_outagedur.png")
+print(f"  {OUT_DIR}/bivariate_quartile_values.csv")
