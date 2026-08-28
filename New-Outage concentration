@@ -1,0 +1,205 @@
+"""
+Outage concentration — composite figure + per-quantity concentration tables
+===========================================================================
+Composite 2x2 figure:
+  A (top-left)   : pooled Lorenz curves, ABSOLUTE vs NORMALIZED burden (Gini in legend)
+  B (top-right)  : Gini per year, both metrics
+  C (bottom-left): CONUS map of ABSOLUTE burden   -- PERCENTILE + PowerNorm
+  D (bottom-right): CONUS map of NORMALIZED burden -- PERCENTILE + PowerNorm
+
+Maps are shaded by the county's PERCENTILE of burden (uniform, so geography is
+visible instead of being washed out by a few extreme counties), with PowerNorm
+(gamma<1) to further lift mid-range contrast -- matching the old Q2 map style.
+
+FOUR concentration CSVs (one per quantity), rows = periods (each year + pooled):
+  concentration_customer_hour_burden.csv
+  concentration_normalized_customer_hour_burden.csv
+  concentration_n_outage_events.csv
+  concentration_p90_recovery.csv
+each with: n_counties, gini, top1/5/10/20pct_share, bottom50pct_share,
+           counties_to_50pct, counties_to_50pct_share_of_counties
+
+Reads:  outage_event_table_2015_2025.csv, MCC.csv, shapefile
+Writes: Results/Start_From_Begining/figures/fig_outage_concentration_composite.png
+        Results/Start_From_Begining/concentration_*.csv
+Requires: pandas, numpy, matplotlib, geopandas
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm
+import geopandas as gpd
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3/Power_Outage_ZeroFill"
+Q1_3 = f"{BASE}/Results/Q1_3"
+MCC_CSV = f"{BASE}/MCC.csv"
+OUT_DIR = f"{BASE}/Results/Start_From_Begining"
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+OUTAGE_CSV = f"{Q1_3}/outage_event_table_2015_2025.csv"
+SHP = f"{BASE}/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+NON_CONUS = {"02", "15", "72", "66", "78", "60", "69"}
+MISSING_COLOR = "#d9d9d9"
+ABS_COLOR = "#238b45"    # green (absolute) - matches map C
+NORM_COLOR = "#6a51a3"   # purple (normalized) - matches map D
+GAMMA = 2.5   # >1 pushes low/mid to white, only the top counties get dark
+
+# custom ramps (white -> saturated), used on percentile with PowerNorm
+GREEN_CMAP = LinearSegmentedColormap.from_list("burden_green",
+    ["#ffffff", "#f7fcfd", "#e5f5f9", "#ccece6", "#99d8c9",
+     "#66c2a4", "#41ae76", "#238b45", "#006d2c", "#00441b"], N=256)
+PURPLE_CMAP = LinearSegmentedColormap.from_list("burden_purple",
+    ["#ffffff", "#fcfbfd", "#efedf5", "#dadaeb", "#bcbddc",
+     "#9e9ac8", "#807dba", "#6a51a3", "#54278f", "#3f007d"], N=256)
+
+
+def load_mcc(path):
+    m = pd.read_csv(path); m.columns = [c.strip() for c in m.columns]
+    fc = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    cc = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[cc] = pd.to_numeric(m[cc], errors="coerce")
+    fn = pd.to_numeric(m[fc], errors="coerce")
+    m = m[fn.notna() & m[cc].notna()]
+    return dict(zip(fn[fn.notna()].astype("int64").astype(str).str.zfill(5), m[cc]))
+
+
+def lorenz_xy(values):
+    x = pd.to_numeric(pd.Series(values), errors="coerce").dropna().values
+    x = np.sort(x)[::-1]; x = x[x > 0]
+    if x.size == 0:
+        return None, None
+    cum_b = np.cumsum(x) / x.sum() * 100.0
+    cum_c = np.arange(1, x.size + 1) / x.size * 100.0
+    return np.concatenate([[0], cum_c]), np.concatenate([[0], cum_b])
+
+
+def gini(values):
+    v = np.sort(pd.to_numeric(pd.Series(values), errors="coerce").dropna().values)
+    v = v[v >= 0]
+    if v.size == 0 or v.sum() == 0:
+        return np.nan
+    n = v.size; cum = np.cumsum(v)
+    return (n + 1 - 2 * (cum / cum[-1]).sum()) / n
+
+
+def concentration_stats(values):
+    v = np.sort(pd.to_numeric(pd.Series(values), errors="coerce").dropna().values)[::-1]
+    v = v[v > 0]
+    if v.size == 0:
+        return None
+    tot = v.sum(); n = v.size
+    def topsh(f):
+        k = max(1, int(np.ceil(f * n))); return v[:k].sum() / tot * 100
+    bottom50 = v[int(np.floor(0.5 * n)):].sum() / tot * 100
+    cum = np.cumsum(v) / tot
+    k50 = int(np.searchsorted(cum, 0.50) + 1); k50 = min(k50, n)
+    return {"n_counties": n, "gini": round(gini(v), 4),
+            "top1pct_share": round(topsh(0.01), 2),
+            "top5pct_share": round(topsh(0.05), 2),
+            "top10pct_share": round(topsh(0.10), 2),
+            "top20pct_share": round(topsh(0.20), 2),
+            "bottom50pct_share": round(bottom50, 2),
+            "counties_to_50pct": k50,
+            "counties_to_50pct_share_of_counties": round(k50 / n * 100, 2)}
+
+
+# ---- build metrics ----
+ot = pd.read_csv(OUTAGE_CSV, dtype={"county_fips": str})
+ot["county_fips"] = ot["county_fips"].str.zfill(5)
+ot["year"] = pd.to_numeric(ot["year"], errors="coerce")
+for c in ["auc", "recovery_hr"]:
+    ot[c] = pd.to_numeric(ot[c], errors="coerce")
+mcc = load_mcc(MCC_CSV)
+
+
+def county_metrics(sub):
+    g = sub.groupby("county_fips").agg(
+        abs_burden=("auc", "sum"),
+        n_events=("county_fips", "size"),
+        p90_recovery=("recovery_hr",
+                      lambda s: np.percentile(s.dropna(), 90) if s.notna().any() else 0.0)
+    ).reset_index()
+    sv = g["county_fips"].map(mcc).astype(float)
+    g["norm_burden"] = g["abs_burden"] / sv.where(sv > 0, np.nan)
+    return g
+
+
+pooled = county_metrics(ot)
+years = sorted(int(y) for y in ot["year"].dropna().unique())
+per_year_g = {yr: county_metrics(ot[ot["year"] == yr]) for yr in years}
+
+# ---- four per-quantity CSVs ----
+QCOLS = {"customer_hour_burden": "abs_burden",
+         "normalized_customer_hour_burden": "norm_burden",
+         "n_outage_events": "n_events",
+         "p90_recovery": "p90_recovery"}
+for qname, col in QCOLS.items():
+    rows = []
+    st = concentration_stats(pooled[col])
+    if st: rows.append({"period": "2015_2025", **st})
+    for yr in years:
+        st = concentration_stats(per_year_g[yr][col])
+        if st: rows.append({"period": str(yr), **st})
+    pd.DataFrame(rows).to_csv(f"{OUT_DIR}/concentration_{qname}.csv", index=False)
+    print(f"wrote concentration_{qname}.csv")
+
+# ---- percentiles for maps ----
+pooled["abs_pct"] = pooled["abs_burden"].rank(pct=True) * 100
+pooled["norm_pct"] = pooled["norm_burden"].rank(pct=True) * 100
+
+gdf = gpd.read_file(SHP)
+gdf["county_fips"] = gdf["GEOID"].astype(str).str.zfill(5)
+gdf = gdf[~gdf["county_fips"].str[:2].isin(NON_CONUS)].to_crs("EPSG:5070")
+geo = gdf.merge(pooled, on="county_fips", how="left")
+
+# ---- composite ----
+fig = plt.figure(figsize=(18, 14))
+
+ax1 = fig.add_subplot(2, 2, 1)
+ax1.plot([0, 100], [0, 100], "k--", lw=1.2, alpha=0.7, label="Line of equality")
+for col, color, name in [("abs_burden", ABS_COLOR, "Absolute burden"),
+                         ("norm_burden", NORM_COLOR, "Normalized burden")]:
+    cx, cy = lorenz_xy(pooled[col])
+    if cx is not None:
+        ax1.plot(cx, cy, lw=2.4, color=color,
+                 label=f"{name} (Gini = {gini(pooled[col]):.2f})")
+ax1.set_xlabel("Cumulative share of counties (%) — highest burden first")
+ax1.set_ylabel("Cumulative share of total (%)")
+ax1.set_title("A. Outage burden concentration (Lorenz), 2015-2025")
+ax1.set_xlim(0, 100); ax1.set_ylim(0, 100); ax1.set_aspect("equal")
+ax1.legend(loc="lower right", fontsize=9); ax1.grid(alpha=0.3)
+
+ax2 = fig.add_subplot(2, 2, 2)
+ax2.plot(years, [gini(per_year_g[y]["abs_burden"]) for y in years], "-o",
+         color=ABS_COLOR, label="Absolute burden")
+ax2.plot(years, [gini(per_year_g[y]["norm_burden"]) for y in years], "-o",
+         color=NORM_COLOR, label="Normalized burden")
+ax2.set_xlabel("Year"); ax2.set_ylabel("Gini (concentration)")
+ax2.set_title("B. Concentration over time (Gini per year)")
+ax2.set_ylim(0.7, 1.0); ax2.grid(alpha=0.3); ax2.legend(fontsize=9)
+
+norm = PowerNorm(gamma=GAMMA, vmin=0, vmax=100)
+ax3 = fig.add_subplot(2, 2, 3)
+geo.plot(column="abs_pct", cmap=GREEN_CMAP, norm=norm, linewidth=0.04,
+         edgecolor="white", ax=ax3, legend=True,
+         missing_kwds={"color": MISSING_COLOR},
+         legend_kwds={"shrink": 0.55, "label": "Absolute burden (percentile)"})
+ax3.set_axis_off(); ax3.set_title("C. Absolute customer-hour burden (percentile)")
+
+ax4 = fig.add_subplot(2, 2, 4)
+geo.plot(column="norm_pct", cmap=PURPLE_CMAP, norm=norm, linewidth=0.04,
+         edgecolor="white", ax=ax4, legend=True,
+         missing_kwds={"color": MISSING_COLOR},
+         legend_kwds={"shrink": 0.55, "label": "Normalized burden (percentile)"})
+ax4.set_axis_off(); ax4.set_title("D. Normalized customer-hour burden (percentile)")
+
+fig.suptitle("Outage burden concentration, 2015-2025",
+             fontsize=16, y=0.99)
+fig.tight_layout(rect=[0, 0, 1, 0.98])
+fig.savefig(f"{FIG_DIR}/fig_outage_concentration_composite.png", dpi=300)
+plt.close(fig)
+print(f"\nWrote {FIG_DIR}/fig_outage_concentration_composite.png")
