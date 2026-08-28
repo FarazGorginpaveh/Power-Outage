@@ -1,0 +1,112 @@
+"""
+Hazard exposure vs MCC-normalized outage burden (clean quadrant scatter)
+===================================================================================
+Scatter of storm exposure percentile (x) vs normalized customer-hour burden
+percentile (y), each split at 50 into four quadrants. No county annotations,
+no stats in the title.
+
+    exposure_pct = percentile(n_storms)
+    burden_pct   = percentile(customer_hours / customers_served)  [cap1: sat->100]
+
+Reads:  county_level_storm_records_2015_2025.csv, outage_event_table_2015_2025.csv, MCC.csv
+Writes: Results/Start_From_Begining/figures/fig1_exposure_vs_burden_scatter.png
+Requires: pandas, numpy, matplotlib
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3/Power_Outage_ZeroFill"
+Q1_3 = f"{BASE}/Results/Q1_3"
+MCC_CSV = f"{BASE}/MCC.csv"
+OUT_DIR = f"{BASE}/Results/Start_From_Begining"
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+STORM_CSV = f"{Q1_3}/county_level_storm_records_2015_2025.csv"
+OUTAGE_CSV = f"{Q1_3}/outage_event_table_2015_2025.csv"
+SPLIT = 50.0
+
+COL = {"HH": "#8c4a63",   # high exp, high burden (dark maroon)
+       "HL": "#6f9bd1",   # high exp, low burden  (blue)
+       "LH": "#e8695f",   # low exp, high burden  (salmon/red)
+       "LL": "#d9d9d9"}   # low exp, low burden   (light grey)
+LEG = {"HH": "High Exposure - High Burden", "HL": "High Exposure - Low Burden",
+       "LH": "Low Exposure - High Burden", "LL": "Low Exposure - Low Burden"}
+
+
+def load_mcc(path):
+    m = pd.read_csv(path); m.columns = [c.strip() for c in m.columns]
+    fc = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    cc = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[cc] = pd.to_numeric(m[cc], errors="coerce")
+    fn = pd.to_numeric(m[fc], errors="coerce")
+    m = m[fn.notna() & m[cc].notna()]
+    return dict(zip(fn[fn.notna()].astype("int64").astype(str).str.zfill(5), m[cc]))
+
+
+def pctl(s):
+    return s.fillna(0).rank(pct=True, method="average") * 100.0
+
+
+# exposure
+st = pd.read_csv(STORM_CSV, dtype={"county_fips": str})
+st["county_fips"] = st["county_fips"].str.zfill(5)
+expo = st.groupby("county_fips").size().rename("n_storms").reset_index()
+
+# burden (normalized, cap1 corrected)
+ot = pd.read_csv(OUTAGE_CSV, dtype={"county_fips": str})
+ot["county_fips"] = ot["county_fips"].str.zfill(5)
+for c in ["auc", "peak_customers_out"]:
+    ot[c] = pd.to_numeric(ot[c], errors="coerce")
+ob = ot.groupby("county_fips").agg(
+    customer_hours=("auc", "sum"),
+    peak=("peak_customers_out", lambda s: np.percentile(s.dropna(), 90)
+          if s.notna().any() else np.nan)).reset_index()
+
+mcc = load_mcc(MCC_CSV)
+df = expo.merge(ob, on="county_fips", how="outer")
+df["n_storms"] = df["n_storms"].fillna(0)
+served = df["county_fips"].map(mcc).astype(float)
+served = served.where(served > 0, np.nan)
+flag = (served < df["peak"]).fillna(False)
+norm = (df["customer_hours"] / served).replace([np.inf, -np.inf], np.nan)
+df = df[served.notna()].copy()
+served = served[df.index]; flag = flag[df.index]; norm = norm[df.index]
+maxb = norm[~flag].max()
+norm = norm.where(~flag, maxb)
+
+df["exposure_pct"] = pctl(df["n_storms"])
+df["burden_pct"] = pctl(norm)
+df.loc[flag.values, "burden_pct"] = 100.0
+
+hx = df["exposure_pct"] > SPLIT
+hy = df["burden_pct"] > SPLIT
+df["quad"] = np.where(hx & hy, "HH", np.where(hx & ~hy, "HL",
+                      np.where(~hx & hy, "LH", "LL")))
+
+# ---- plot ----
+fig, ax = plt.subplots(figsize=(9, 9))
+for k in ["LL", "HL", "LH", "HH"]:
+    s = df[df["quad"] == k]
+    ax.scatter(s["exposure_pct"], s["burden_pct"], s=14, alpha=0.75,
+               color=COL[k], edgecolors="none",
+               label=f"{LEG[k]} (n={len(s):,})")
+ax.axvline(SPLIT, color="gray", lw=0.8, alpha=0.7)
+ax.axhline(SPLIT, color="gray", lw=0.8, alpha=0.7)
+ax.plot([0, 100], [0, 100], "k--", lw=1, alpha=0.6,
+        label="Perfect exposure-burden agreement")
+ax.set_xlabel("Storm exposure percentile")
+ax.set_ylabel("Normalized customer-hour burden percentile (MCC-normalized)")
+ax.set_title("Figure 1. Hazard exposure vs MCC-normalized outage burden")
+ax.set_xlim(-1, 101); ax.set_ylim(-1, 101)
+ax.legend(loc="lower right", fontsize=8, framealpha=0.95)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig1_exposure_vs_burden_scatter.png", dpi=300)
+plt.close(fig)
+print("quadrant counts:")
+print(df["quad"].value_counts().to_string())
+print(f"\nWrote {FIG_DIR}/fig1_exposure_vs_burden_scatter.png")
