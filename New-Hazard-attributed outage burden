@@ -1,0 +1,1429 @@
+"""
+Hazard-attributed outage burden: 6h vs 12h buffer (absolute only)
+=================================================================
+
+Three common hazards:
+    Thunderstorm Wind
+    Flood
+    Tornado
+
+Figure structure:
+
+    rows 1-2 : per-hazard ABSOLUTE burden maps
+               row 1 = 6h
+               row 2 = 12h
+
+    spacer    : small visual gap
+
+    row 3     : two DOMINANT-hazard maps
+               left = 6h
+               right = 12h
+
+    spacer    : small visual gap
+
+    row 4     : left  = number of counties per hazard, 6h vs 12h
+               right = concentration Gini per hazard, 6h vs 12h
+
+Hazard attribution:
+    nearest storm within +/- buffer of the outage peak.
+
+Outputs:
+    figures/fig_hazard_outage_6h_12h.png
+    hazard_outage_concentration_6h_12h.csv
+
+Requires:
+    pandas
+    numpy
+    matplotlib
+    geopandas
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm
+from matplotlib.patches import Patch
+import geopandas as gpd
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3/Power_Outage_ZeroFill"
+
+Q1_3 = f"{BASE}/Results/Q1_3"
+
+MCC_CSV = f"{BASE}/MCC.csv"
+
+OUT_DIR = f"{BASE}/Results/Start_From_Begining"
+
+FIG_DIR = f"{OUT_DIR}/figures"
+
+os.makedirs(FIG_DIR, exist_ok=True)
+
+
+LINKED_CSV = (
+    f"{Q1_3}/storm_linked_outage_events_2015_2025.csv"
+)
+
+STORM_CSV = (
+    f"{Q1_3}/county_level_storm_records_2015_2025.csv"
+)
+
+SHP = (
+    f"{BASE}/RQ2/shapefiles/cb_2022_us_county_5m.shp"
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+NON_CONUS = {
+    "02",  # Alaska
+    "15",  # Hawaii
+    "72",  # Puerto Rico
+    "66",
+    "78",
+    "60",
+    "69",
+}
+
+MISSING_COLOR = "#e6e6e6"
+
+BUFFERS = [6, 12]
+
+HAZARDS = [
+    "Thunderstorm Wind",
+    "Flood",
+    "Tornado",
+]
+
+GAMMA = 2.5
+
+
+# ============================================================
+# COLORS
+# ============================================================
+
+HAZ_COLOR = {
+    "Thunderstorm Wind": "#2166ac",
+    "Flood": "#238b45",
+    "Tornado": "#d94801",
+}
+
+HAZ_DARK = {
+    "Thunderstorm Wind": "#08306b",
+    "Flood": "#00441b",
+    "Tornado": "#7f2704",
+}
+
+CMAPS = {
+    h: LinearSegmentedColormap.from_list(
+        h,
+        [
+            "#ffffff",
+            HAZ_COLOR[h],
+            HAZ_DARK[h],
+        ],
+        N=256,
+    )
+    for h in HAZARDS
+}
+
+
+# ============================================================
+# STORM TYPE GROUPING
+# ============================================================
+
+STORM_MAP = {
+
+    "Thunderstorm Wind": "Thunderstorm Wind",
+    "Lightning": "Thunderstorm Wind",
+    "Hail": "Thunderstorm Wind",
+
+    "Hurricane": "Tropical Cyclone",
+    "Hurricane (Typhoon)": "Tropical Cyclone",
+    "Tropical Storm": "Tropical Cyclone",
+    "Tropical Depression": "Tropical Cyclone",
+    "Storm Surge/Tide": "Tropical Cyclone",
+
+    "Flood": "Flood",
+    "Flash Flood": "Flood",
+    "Coastal Flood": "Flood",
+    "Heavy Rain": "Flood",
+    "Excessive Rainfall": "Flood",
+
+    "Tornado": "Tornado",
+    "Funnel Cloud": "Tornado",
+    "Waterspout": "Tornado",
+
+    "Winter Storm": "Winter Storm",
+    "Winter Weather": "Winter Storm",
+    "Blizzard": "Winter Storm",
+    "Ice Storm": "Winter Storm",
+    "Heavy Snow": "Winter Storm",
+    "Sleet": "Winter Storm",
+    "Lake-Effect Snow": "Winter Storm",
+
+    "High Wind": "High Wind",
+    "Strong Wind": "High Wind",
+}
+
+
+# ============================================================
+# LOAD MCC
+# ============================================================
+
+def load_mcc(path):
+
+    m = pd.read_csv(path)
+
+    m.columns = [
+        c.strip()
+        for c in m.columns
+    ]
+
+    fc = (
+        "County_FIPS"
+        if "County_FIPS" in m.columns
+        else m.columns[0]
+    )
+
+    cc = (
+        "Customers"
+        if "Customers" in m.columns
+        else m.columns[1]
+    )
+
+    m[cc] = pd.to_numeric(
+        m[cc],
+        errors="coerce",
+    )
+
+    fn = pd.to_numeric(
+        m[fc],
+        errors="coerce",
+    )
+
+    m = m[
+        fn.notna()
+        & m[cc].notna()
+    ]
+
+    return dict(
+        zip(
+            fn[
+                fn.notna()
+            ]
+            .astype("int64")
+            .astype(str)
+            .str.zfill(5),
+
+            m[cc],
+        )
+    )
+
+
+# ============================================================
+# GINI
+# ============================================================
+
+def gini(v):
+
+    v = np.sort(
+        np.asarray(v, float)
+    )
+
+    v = v[v >= 0]
+
+    if (
+        v.size == 0
+        or v.sum() == 0
+    ):
+        return np.nan
+
+    n = v.size
+
+    cum = np.cumsum(v)
+
+    return (
+        n
+        + 1
+        - 2
+        * (
+            cum / cum[-1]
+        ).sum()
+    ) / n
+
+
+# ============================================================
+# CONCENTRATION STATISTICS
+# ============================================================
+
+def conc_stats(v):
+
+    v = np.sort(
+        np.asarray(v, float)
+    )[::-1]
+
+    v = v[v > 0]
+
+    if v.size == 0:
+        return None
+
+    tot = v.sum()
+
+    n = v.size
+
+    top = lambda f: (
+        v[
+            :max(
+                1,
+                int(
+                    np.ceil(
+                        f * n
+                    )
+                ),
+            )
+        ].sum()
+        / tot
+        * 100
+    )
+
+    cum = (
+        np.cumsum(v)
+        / tot
+    )
+
+    k50 = min(
+        int(
+            np.searchsorted(
+                cum,
+                0.5,
+            )
+            + 1
+        ),
+        n,
+    )
+
+    return {
+
+        "n_counties": n,
+
+        "gini": round(
+            gini(v),
+            4,
+        ),
+
+        "top1pct_share": round(
+            top(0.01),
+            2,
+        ),
+
+        "top5pct_share": round(
+            top(0.05),
+            2,
+        ),
+
+        "top10pct_share": round(
+            top(0.10),
+            2,
+        ),
+
+        "counties_to_50pct": k50,
+    }
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+mcc = load_mcc(
+    MCC_CSV
+)
+
+
+# ---------------- Storm records ----------------
+
+st = pd.read_csv(
+    STORM_CSV,
+    dtype={
+        "county_fips": str
+    },
+)
+
+st["county_fips"] = (
+    st["county_fips"]
+    .str.zfill(5)
+)
+
+st["hazard"] = (
+    st["event_type"]
+    .map(STORM_MAP)
+    .fillna("Other")
+)
+
+st["s_start"] = pd.to_datetime(
+    st["start_time"],
+    errors="coerce",
+)
+
+st["s_end"] = pd.to_datetime(
+    st["end_time"],
+    errors="coerce",
+)
+
+st = st.dropna(
+    subset=[
+        "s_start",
+        "s_end",
+    ]
+)
+
+storms_by_c = {
+    c: g
+    for c, g
+    in st.groupby(
+        "county_fips"
+    )
+}
+
+
+# ---------------- Outage events ----------------
+
+outs = pd.read_csv(
+    LINKED_CSV,
+    dtype={
+        "county_fips": str
+    },
+)
+
+outs["county_fips"] = (
+    outs["county_fips"]
+    .str.zfill(5)
+)
+
+outs["auc"] = pd.to_numeric(
+    outs["auc"],
+    errors="coerce",
+)
+
+outs["peak_dt"] = pd.to_datetime(
+    outs["peak_time"],
+    errors="coerce",
+).fillna(
+
+    pd.to_datetime(
+        outs["event_start"],
+        errors="coerce",
+    )
+)
+
+outs = outs.dropna(
+    subset=[
+        "peak_dt"
+    ]
+)
+
+
+# ---------------- County shapefile ----------------
+
+gdf = gpd.read_file(
+    SHP
+)
+
+gdf["county_fips"] = (
+    gdf["GEOID"]
+    .astype(str)
+    .str.zfill(5)
+)
+
+gdf = gdf[
+    ~gdf[
+        "county_fips"
+    ]
+    .str[:2]
+    .isin(
+        NON_CONUS
+    )
+]
+
+gdf = gdf.to_crs(
+    "EPSG:5070"
+)
+
+
+# ============================================================
+# BOOLEAN HELPER
+# ============================================================
+
+def truthy(s):
+
+    return (
+        s
+        .astype(str)
+        .str.lower()
+        .isin(
+            [
+                "true",
+                "1",
+                "1.0",
+                "yes",
+                "t",
+            ]
+        )
+    )
+
+
+# ============================================================
+# ATTRIBUTE OUTAGE TO NEAREST STORM
+# ============================================================
+
+def attribute(
+    o_df,
+    buffer_hr,
+):
+
+    buf = np.timedelta64(
+        buffer_hr,
+        "h",
+    )
+
+    haz = np.array(
+        [None] * len(o_df),
+        dtype=object,
+    )
+
+    pos = {
+        ix: i
+        for i, ix
+        in enumerate(
+            o_df.index
+        )
+    }
+
+    for c, og in o_df.groupby(
+        "county_fips"
+    ):
+
+        sg = storms_by_c.get(c)
+
+        if (
+            sg is None
+            or len(sg) == 0
+        ):
+            continue
+
+        ss = (
+            sg["s_start"]
+            .values
+            .astype(
+                "datetime64[ns]"
+            )
+        )
+
+        se = (
+            sg["s_end"]
+            .values
+            .astype(
+                "datetime64[ns]"
+            )
+        )
+
+        sh = (
+            sg["hazard"]
+            .values
+        )
+
+        peaks = (
+            og["peak_dt"]
+            .values
+            .astype(
+                "datetime64[ns]"
+            )
+        )
+
+        loc = [
+            pos[ix]
+            for ix
+            in og.index
+        ]
+
+        ch = max(
+            1,
+            min(
+                4000,
+                int(
+                    2_000_000
+                    / max(
+                        1,
+                        len(sg),
+                    )
+                ),
+            ),
+        )
+
+        for i in range(
+            0,
+            len(peaks),
+            ch,
+        ):
+
+            P = peaks[
+                i:i + ch
+            ][:, None]
+
+            dist = np.maximum(
+
+                np.maximum(
+                    ss[None, :]
+                    - P,
+
+                    P
+                    - se[None, :],
+                ),
+
+                np.timedelta64(
+                    0,
+                    "ns",
+                ),
+            )
+
+            within = (
+                dist <= buf
+            )
+
+            df_ = (
+                dist
+                .astype(
+                    "timedelta64[s]"
+                )
+                .astype(float)
+            )
+
+            df_[
+                ~within
+            ] = np.inf
+
+            j = df_.argmin(
+                axis=1
+            )
+
+            any_ = within.any(
+                axis=1
+            )
+
+            sel = np.where(
+                any_,
+                sh[j],
+                None,
+            )
+
+            for r, val in enumerate(
+                sel
+            ):
+
+                haz[
+                    loc[i + r]
+                ] = val
+
+    return pd.Series(
+        haz,
+        index=o_df.index,
+    )
+
+
+# ============================================================
+# COUNTY-LEVEL HAZARD BURDEN
+# ============================================================
+
+def hazard_county(
+    buffer_hr
+):
+
+    o = outs[
+        truthy(
+            outs[
+                f"storm_linked_{buffer_hr}h"
+            ]
+        )
+    ].copy()
+
+    o["hazard"] = attribute(
+        o,
+        buffer_hr,
+    )
+
+    o = o[
+        o["hazard"]
+        .isin(
+            HAZARDS
+        )
+    ]
+
+    return (
+        o
+        .groupby(
+            [
+                "county_fips",
+                "hazard",
+            ]
+        )["auc"]
+        .sum()
+        .rename(
+            "abs_burden"
+        )
+        .reset_index()
+    )
+
+
+# ============================================================
+# CALCULATE BOTH BUFFERS
+# ============================================================
+
+data = {
+    b: hazard_county(b)
+    for b in BUFFERS
+}
+
+
+for b in BUFFERS:
+
+    print(
+        f"\n{b}h county counts:\n",
+        data[b]
+        .groupby(
+            "hazard"
+        )["county_fips"]
+        .nunique()
+        .to_string(),
+    )
+
+
+# ============================================================
+# MAP NORMALIZATION
+# ============================================================
+
+norm = PowerNorm(
+    gamma=GAMMA,
+    vmin=0,
+    vmax=100,
+)
+
+nH = len(
+    HAZARDS
+)
+
+
+# ============================================================
+# CREATE FIGURE
+# ============================================================
+
+fig = plt.figure(
+    figsize=(
+        19,
+        16,
+    )
+)
+
+
+# ============================================================
+# CUSTOM GRID
+#
+# Row 0 = 6h hazard maps
+# Row 1 = 12h hazard maps
+# Row 2 = SMALL SPACER
+# Row 3 = dominant-hazard maps
+# Row 4 = SMALL SPACER
+# Row 5 = bottom statistics
+#
+# This gives much more direct control over spacing.
+# ============================================================
+
+gs = fig.add_gridspec(
+    6,
+    6,
+
+    height_ratios=[
+        1.30,
+        1.30,
+        0.09,
+        1.70,
+        0.09,
+        0.80,
+    ],
+
+    hspace=0.015,
+    wspace=0.03,
+
+    # slightly lower first row to leave a small gap below main title
+    top=0.945,
+
+    bottom=0.055,
+    left=0.035,
+    right=0.985,
+)
+
+
+# ============================================================
+# ROWS 1-2:
+# PER-HAZARD ABSOLUTE BURDEN MAPS
+# ============================================================
+
+for row, b in enumerate(
+    BUFFERS
+):
+
+    for col, h in enumerate(
+        HAZARDS
+    ):
+
+        sub = data[b][
+            data[b]["hazard"] == h
+        ].copy()
+
+        sub["abs_pct"] = (
+            sub["abs_burden"]
+            .rank(
+                pct=True
+            )
+            * 100
+        )
+
+        geo = gdf.merge(
+            sub,
+            on="county_fips",
+            how="left",
+        )
+
+        ax = fig.add_subplot(
+            gs[
+                row,
+                2 * col:
+                2 * col + 2,
+            ]
+        )
+
+        geo.plot(
+
+            column="abs_pct",
+
+            cmap=CMAPS[h],
+
+            norm=norm,
+
+            linewidth=0.03,
+
+            edgecolor="white",
+
+            ax=ax,
+
+            missing_kwds={
+                "color": MISSING_COLOR
+            },
+        )
+
+        ax.set_axis_off()
+
+
+        # -------------------------
+        # Hazard titles
+        # -------------------------
+
+        if row == 0:
+
+            ax.set_title(
+                h,
+                fontsize=14,
+                fontweight="bold",
+                color="black",
+
+                # Slightly closer to maps
+                pad=3,
+            )
+
+
+        # -------------------------
+        # Row labels
+        # -------------------------
+
+        if col == 0:
+
+            ax.text(
+
+                -0.04,
+
+                0.5,
+
+                f"{b}h buffer",
+
+                transform=ax.transAxes,
+
+                rotation=90,
+
+                va="center",
+
+                fontsize=13,
+            )
+
+
+# ============================================================
+# DOMINANT HAZARD FUNCTION
+# ============================================================
+
+def dominant(g):
+
+    piv = g.pivot_table(
+
+        index="county_fips",
+
+        columns="hazard",
+
+        values="abs_burden",
+
+        aggfunc="sum",
+    )
+
+    for h in HAZARDS:
+
+        if h not in piv.columns:
+
+            piv[h] = np.nan
+
+    return (
+
+        piv[
+            HAZARDS
+        ]
+
+        .idxmax(
+            axis=1
+        )
+
+        .rename(
+            "dominant"
+        )
+
+        .reset_index()
+
+        .dropna(
+            subset=[
+                "dominant"
+            ]
+        )
+    )
+
+
+# ============================================================
+# ROW 3:
+# DOMINANT HAZARD MAPS
+# ============================================================
+
+# Keep references to both map axes so the shared legend can be
+# positioned exactly in the gap between the two CONUS maps.
+dominant_axes = []
+
+for i, b in enumerate(
+    BUFFERS
+):
+
+    dom = dominant(
+        data[b]
+    )
+
+    geo_d = gdf.merge(
+        dom,
+        on="county_fips",
+        how="left",
+    )
+
+
+    if i == 0:
+
+        ax = fig.add_subplot(
+            gs[
+                3,
+                0:3,
+            ]
+        )
+
+    else:
+
+        ax = fig.add_subplot(
+            gs[
+                3,
+                3:6,
+            ]
+        )
+
+
+    # -------------------------
+    # No attributed outage
+    # -------------------------
+
+    geo_d[
+        geo_d[
+            "dominant"
+        ].isna()
+    ].plot(
+
+        ax=ax,
+
+        color=MISSING_COLOR,
+
+        linewidth=0.03,
+
+        edgecolor="white",
+    )
+
+
+    # -------------------------
+    # Dominant hazards
+    # -------------------------
+
+    for h in HAZARDS:
+
+        s = geo_d[
+            geo_d[
+                "dominant"
+            ] == h
+        ]
+
+        if len(s):
+
+            s.plot(
+
+                ax=ax,
+
+                color=HAZ_COLOR[h],
+
+                linewidth=0.03,
+
+                edgecolor="white",
+            )
+
+
+    ax.set_axis_off()
+
+
+    ax.set_title(
+
+        f"Dominant hazard by county — {b}h buffer",
+
+        fontsize=13,
+        fontweight="bold",
+
+        # Reduce title-to-map distance
+        pad=3,
+    )
+
+    dominant_axes.append(ax)
+
+
+# -------------------------
+# One shared legend centered in the gap between the two maps
+# -------------------------
+legend_handles = [
+    Patch(color=HAZ_COLOR[h], label=h)
+    for h in HAZARDS
+] + [
+    Patch(color=MISSING_COLOR, label="no attributed outage")
+]
+
+# Draw once so Matplotlib has finalized the geographic axes positions.
+fig.canvas.draw()
+
+left_pos = dominant_axes[0].get_position()
+right_pos = dominant_axes[1].get_position()
+
+legend_x = (left_pos.x1 + right_pos.x0) / 2
+legend_y = (left_pos.y0 + left_pos.y1) / 2
+
+fig.legend(
+    handles=legend_handles,
+    loc="center",
+    bbox_to_anchor=(legend_x, legend_y),
+    bbox_transform=fig.transFigure,
+    fontsize=9,
+    frameon=False,
+    ncol=1,
+    handlelength=1.4,
+    handletextpad=0.5,
+    borderaxespad=0.0,
+)
+
+
+# ============================================================
+# CONCENTRATION STATISTICS
+# ============================================================
+
+rows = []
+
+
+for b in BUFFERS:
+
+    for h in HAZARDS:
+
+        cs = conc_stats(
+
+            data[b][
+                data[b][
+                    "hazard"
+                ] == h
+            ][
+                "abs_burden"
+            ]
+        )
+
+        if cs:
+
+            rows.append(
+                {
+                    "buffer_h": b,
+                    "hazard": h,
+                    **cs,
+                }
+            )
+
+
+cdf = pd.DataFrame(
+    rows
+)
+
+
+cdf.to_csv(
+
+    f"{OUT_DIR}/hazard_outage_concentration_6h_12h.csv",
+
+    index=False,
+)
+
+
+# ============================================================
+# BAR SETTINGS
+# ============================================================
+
+x = np.arange(
+    nH
+)
+
+w = 0.38
+
+hcol = [
+    HAZ_COLOR[h]
+    for h in HAZARDS
+]
+
+
+def val(
+    b,
+    h,
+    key,
+):
+
+    r = cdf[
+        (cdf.buffer_h == b)
+        &
+        (cdf.hazard == h)
+    ]
+
+    return (
+        r[key].iloc[0]
+        if len(r)
+        else 0
+    )
+
+
+# ============================================================
+# BOTTOM CHART LAYOUT
+# Slightly narrower charts with a small gap between them
+# ============================================================
+
+bottom_gs = gs[5, :].subgridspec(
+    1,
+    3,
+    width_ratios=[1.0, 0.08, 1.0],
+    wspace=0.0,
+)
+
+
+# ============================================================
+# BOTTOM LEFT:
+# NUMBER OF COUNTIES
+# ============================================================
+
+ax1 = fig.add_subplot(bottom_gs[0, 0])
+
+
+n6 = [
+    val(
+        6,
+        h,
+        "n_counties",
+    )
+    for h in HAZARDS
+]
+
+
+n12 = [
+    val(
+        12,
+        h,
+        "n_counties",
+    )
+    for h in HAZARDS
+]
+
+
+ax1.bar(
+
+    x - w / 2,
+
+    n6,
+
+    w,
+
+    color=hcol,
+)
+
+
+ax1.bar(
+
+    x + w / 2,
+
+    n12,
+
+    w,
+
+    color=hcol,
+
+    hatch="//",
+
+    alpha=0.65,
+)
+
+
+ax1.set_xticks(
+    x
+)
+
+
+ax1.set_xticklabels(
+
+    HAZARDS,
+
+    rotation=15,
+
+    ha="right",
+
+    fontsize=10,
+)
+
+
+ax1.set_ylabel(
+    "Number of counties"
+)
+
+
+ax1.set_title(
+
+    "Counties with attributed outages",
+    fontweight="bold",
+
+    fontsize=12,
+
+    pad=4,
+)
+
+
+ax1.legend(
+
+    handles=[
+
+        Patch(
+            facecolor="#888",
+            label="6h",
+        ),
+
+        Patch(
+            facecolor="#888",
+            hatch="//",
+            alpha=0.65,
+            label="12h",
+        ),
+    ],
+
+    fontsize=9,
+)
+
+
+# ============================================================
+# BOTTOM RIGHT:
+# GINI
+# ============================================================
+
+ax2 = fig.add_subplot(bottom_gs[0, 2])
+
+
+g6 = [
+    val(
+        6,
+        h,
+        "gini",
+    )
+    for h in HAZARDS
+]
+
+
+g12 = [
+    val(
+        12,
+        h,
+        "gini",
+    )
+    for h in HAZARDS
+]
+
+
+ax2.bar(
+
+    x - w / 2,
+
+    g6,
+
+    w,
+
+    color=hcol,
+)
+
+
+ax2.bar(
+
+    x + w / 2,
+
+    g12,
+
+    w,
+
+    color=hcol,
+
+    hatch="//",
+
+    alpha=0.65,
+)
+
+
+ax2.set_xticks(
+    x
+)
+
+
+ax2.set_xticklabels(
+
+    HAZARDS,
+
+    rotation=15,
+
+    ha="right",
+
+    fontsize=10,
+)
+
+
+ax2.set_ylabel(
+    "Gini"
+)
+
+
+ax2.set_ylim(
+    0,
+    1,
+)
+
+
+ax2.set_title(
+
+    "Concentration (Gini)",
+
+    fontsize=12,
+    fontweight="bold",
+
+    pad=4,
+)
+
+
+ax2.legend(
+
+    handles=[
+
+        Patch(
+            facecolor="#888",
+            label="6h",
+        ),
+
+        Patch(
+            facecolor="#888",
+            hatch="//",
+            alpha=0.65,
+            label="12h",
+        ),
+    ],
+
+    fontsize=9,
+)
+
+
+# ============================================================
+# MAIN TITLE
+# ============================================================
+
+fig.suptitle(
+
+    "Hazard-attributed outage burden: 6h vs 12h buffer",
+
+    fontsize=18,          # 2 sizes larger than before
+    fontweight="bold",
+    # Lower than original 0.995 so it sits closer to first row
+    y=0.978,
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+fig.savefig(
+
+    f"{FIG_DIR}/fig_hazard_outage_6h_12h.png",
+
+    dpi=250,
+
+    bbox_inches="tight",
+)
+
+
+plt.close(
+    fig
+)
+
+
+# ============================================================
+# OUTPUT MESSAGE
+# ============================================================
+
+print(
+    f"\nWrote "
+    f"{FIG_DIR}/fig_hazard_outage_6h_12h.png"
+)
+
+print(
+    f"  "
+    f"{OUT_DIR}/hazard_outage_concentration_6h_12h.csv"
+)
