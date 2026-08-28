@@ -1,0 +1,168 @@
+"""
+Metric correlation heatmap — storm & outage metrics (pooled 2015-2025)
+======================================================================
+Builds 12 county-level metrics from the event-level tables + MCC, then shows
+their Spearman rank-correlation as a heatmap (all counties, pooled period).
+
+Metrics:
+  Exposure/hazard
+    1  n_storms              # storm records in the county
+    2  storm_hours           sum of storm durations (end-start), hours
+  Outage
+    4  n_outage_events       # outage events
+    5  linkage_rate          storm-linked outages / all outage events (12h)
+    6  p90_peak_outage       P90 of peak_customers_out
+    8  customer_hours        sum of auc  (absolute burden)
+    9  norm_customer_hours   customer_hours / customers_served
+    10 p90_recovery_hr       P90 of recovery_hr
+
+Any metric whose source column is missing is dropped with a printed note
+(never fabricated). Spearman is used throughout (rank-based, robust to skew).
+
+Reads:  county_level_storm_records_2015_2025.csv, outage_event_table_2015_2025.csv,
+        storm_linked_outage_events_2015_2025.csv, MCC.csv
+Writes: Results/Q3_2/metric_correlation_matrix.csv
+        Results/Q3_2/county_metrics_for_correlation.csv
+        Results/Q3_2/figures/fig_metric_correlation_heatmap.png
+Requires: pandas, numpy, matplotlib, scipy
+"""
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+BASE = "/icebox/data/shares/mh1/fgorginpaveh/Project3/Power_Outage_ZeroFill"
+Q1_3 = f"{BASE}/Results/Q1_3"
+MCC_CSV = f"{BASE}/MCC.csv"
+OUT_DIR = f"{BASE}/Results/Start_From_Begining"
+FIG_DIR = f"{OUT_DIR}/figures"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+STORM_CSV = f"{Q1_3}/county_level_storm_records_2015_2025.csv"
+OUTAGE_CSV = f"{Q1_3}/outage_event_table_2015_2025.csv"
+LINKED_CSV = f"{Q1_3}/storm_linked_outage_events_2015_2025.csv"
+
+STORM_MAP = {
+    "Thunderstorm Wind": "Thunderstorm Wind", "Lightning": "Thunderstorm Wind",
+    "Hail": "Thunderstorm Wind",
+    "Hurricane": "Tropical Cyclone", "Hurricane (Typhoon)": "Tropical Cyclone",
+    "Tropical Storm": "Tropical Cyclone", "Tropical Depression": "Tropical Cyclone",
+    "Storm Surge/Tide": "Tropical Cyclone",
+    "Flood": "Flood", "Flash Flood": "Flood", "Coastal Flood": "Flood",
+    "Heavy Rain": "Flood", "Excessive Rainfall": "Flood",
+    "Tornado": "Tornado", "Funnel Cloud": "Tornado", "Waterspout": "Tornado",
+    "Winter Storm": "Winter Storm", "Winter Weather": "Winter Storm",
+    "Blizzard": "Winter Storm", "Ice Storm": "Winter Storm",
+    "Heavy Snow": "Winter Storm", "Sleet": "Winter Storm",
+    "Lake-Effect Snow": "Winter Storm",
+}
+
+
+def load_mcc(path):
+    m = pd.read_csv(path); m.columns = [c.strip() for c in m.columns]
+    fc = "County_FIPS" if "County_FIPS" in m.columns else m.columns[0]
+    cc = "Customers" if "Customers" in m.columns else m.columns[1]
+    m[cc] = pd.to_numeric(m[cc], errors="coerce")
+    fn = pd.to_numeric(m[fc], errors="coerce")
+    m = m[fn.notna() & m[cc].notna()]
+    return dict(zip(fn[fn.notna()].astype("int64").astype(str).str.zfill(5), m[cc]))
+
+
+def p90(s):
+    s = s.dropna()
+    return float(np.percentile(s, 90)) if len(s) else np.nan
+
+
+# ---- storm records -> n_storms, storm_hours ----
+print("storm records ...")
+st = pd.read_csv(STORM_CSV, dtype={"county_fips": str})
+st["county_fips"] = st["county_fips"].str.zfill(5)
+st["s_start"] = pd.to_datetime(st["start_time"], errors="coerce")
+st["s_end"] = pd.to_datetime(st["end_time"], errors="coerce")
+st["dur_hr"] = (st["s_end"] - st["s_start"]).dt.total_seconds() / 3600.0
+st["dur_hr"] = st["dur_hr"].clip(lower=0)
+storm_agg = st.groupby("county_fips").agg(
+    n_storms=("event_type", "size"),
+    storm_hours=("dur_hr", "sum")).reset_index()
+
+# ---- outage table -> n_outage_events, burden, recovery, peak ----
+print("outage table ...")
+ot = pd.read_csv(OUTAGE_CSV, dtype={"county_fips": str})
+ot["county_fips"] = ot["county_fips"].str.zfill(5)
+for c in ["peak_customers_out", "auc", "recovery_hr"]:
+    ot[c] = pd.to_numeric(ot[c], errors="coerce")
+out_agg = ot.groupby("county_fips").agg(
+    n_outage_events=("county_fips", "size"),
+    p90_peak_outage=("peak_customers_out", p90),
+    customer_hours=("auc", "sum"),
+    p90_recovery_hr=("recovery_hr", p90)).reset_index()
+
+# ---- linked file -> linkage rate ----
+print("linked file ...")
+lk = pd.read_csv(LINKED_CSV, dtype={"county_fips": str},
+                 usecols=lambda c: c in {"county_fips", "storm_linked_12h"})
+lk["county_fips"] = lk["county_fips"].str.zfill(5)
+lk["linked"] = lk["storm_linked_12h"].astype(str).str.lower().isin(
+    ["true", "1", "1.0", "yes", "t"])
+link_agg = lk.groupby("county_fips")["linked"].mean().rename(
+    "linkage_rate").reset_index()
+
+# ---- assemble ----
+mcc = load_mcc(MCC_CSV)
+df = storm_agg.merge(out_agg, on="county_fips", how="outer") \
+              .merge(link_agg, on="county_fips", how="outer")
+_size = df["county_fips"].map(mcc).astype(float)
+_size = _size.where(_size > 0, np.nan)
+df["norm_customer_hours"] = df["customer_hours"] / _size
+
+METRICS = ["n_storms", "storm_hours",
+           "n_outage_events", "linkage_rate", "p90_peak_outage",
+           "customer_hours", "norm_customer_hours",
+           "p90_recovery_hr"]
+LABELS = {"n_storms": "Number of storms", "storm_hours": "Storm-duration",
+          "n_outage_events": "Number of outage events",
+          "linkage_rate": "Storm-linkage rate",
+          "p90_peak_outage": "P90 peak outage",
+          "customer_hours": "Customer-hours",
+          "norm_customer_hours": "Normalized customer-hours",
+          "p90_recovery_hr": "P90 recovery (hr)"}
+
+present = [m for m in METRICS if m in df.columns and df[m].notna().sum() > 10]
+dropped = [m for m in METRICS if m not in present]
+if dropped:
+    print("DROPPED (missing/too few values):", dropped)
+
+df.to_csv(f"{OUT_DIR}/county_metrics_for_correlation.csv", index=False)
+print(f"counties assembled: {len(df):,}")
+
+# ---- Spearman correlation ----
+corr = df[present].corr(method="spearman")
+corr.to_csv(f"{OUT_DIR}/metric_correlation_matrix.csv")
+print("\nSpearman correlation matrix:")
+print(corr.round(2).to_string())
+
+# ---- heatmap ----
+labels = [LABELS[m] for m in present]
+n = len(present)
+fig, ax = plt.subplots(figsize=(1.0 * n + 3, 1.0 * n + 2))
+im = ax.imshow(corr.values, cmap="RdBu", vmin=-1, vmax=1)
+ax.set_xticks(range(n)); ax.set_yticks(range(n))
+ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+ax.set_yticklabels(labels, fontsize=9)
+for i in range(n):
+    for j in range(n):
+        v = corr.values[i, j]
+        ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=8,
+                color="white" if abs(v) > 0.55 else "black")
+cb = fig.colorbar(im, ax=ax, shrink=0.8)
+cb.set_label("Spearman Correlation")
+ax.set_title("Storm and Outage Metric Correlations (Spearman, 2015-2025)",
+             fontsize=12, pad=12)
+fig.tight_layout()
+fig.savefig(f"{FIG_DIR}/fig_metric_correlation_heatmap.png", dpi=300)
+plt.close(fig)
+print(f"\nWrote:\n  {OUT_DIR}/metric_correlation_matrix.csv")
+print(f"  {OUT_DIR}/county_metrics_for_correlation.csv")
+print(f"  {FIG_DIR}/fig_metric_correlation_heatmap.png")
